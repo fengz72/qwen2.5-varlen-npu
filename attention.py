@@ -6,7 +6,8 @@
 """
 
 import torch
-from torchair.ops import npu_fused_infer_attention_score
+import torch_npu
+from torchair.ops import npu_fused_infer_attention_score as _torchair_fia
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
@@ -22,19 +23,24 @@ def npu_fia_varlen_forward(module, query, key, value, attention_mask,
     算子根据 actual_seq_lengths 自动生成 block-diagonal causal mask。
 
     动态 shape 策略:
-    - torchair.ops.npu_fused_infer_attention_score (Tensor),
+    - 图编译模式: torchair.ops.npu_fused_infer_attention_score (Tensor),
       actual_seq_lengths 以 tensor 传入, 避免 dynamo specialize, 配合 dynamic=True
+    - eager 模式: torch_npu.npu_fused_infer_attention_score (支持 eager 执行)
     """
-    b, n, s, d = query.shape
-    n_kv = key.shape[1]
+    if query.dim() == 4:
+        n = int(query.shape[1])
+        n_kv = int(key.shape[1])
+        q_t = query.permute(0, 2, 1, 3).squeeze(0).contiguous()
+        k_t = key.permute(0, 2, 1, 3).squeeze(0).contiguous()
+        v_t = value.permute(0, 2, 1, 3).squeeze(0).contiguous()
+    else:
+        n = int(query.shape[1])
+        n_kv = int(key.shape[1])
+        q_t = query.contiguous()
+        k_t = key.contiguous()
+        v_t = value.contiguous()
 
-    # BNSD [B, N, S, D] → TND [S, N, D]  (B=1, packed varlen)
-    q_t = query.permute(0, 2, 1, 3).squeeze(0).contiguous()
-    k_t = key.permute(0, 2, 1, 3).squeeze(0).contiguous()
-    v_t = value.permute(0, 2, 1, 3).squeeze(0).contiguous()
-
-    out, _ = npu_fused_infer_attention_score(
-        q_t, k_t, v_t,
+    fia_kwargs = dict(
         num_heads=n,
         input_layout="TND",
         scale=scaling,
@@ -45,8 +51,13 @@ def npu_fia_varlen_forward(module, query, key, value, attention_mask,
         sparse_mode=3,
     )
 
-    # TND [S, N, D] → BSND [1, S, N, D]
-    out = out.unsqueeze(0).contiguous()
+    if torch.compiler.is_compiling():
+        out, _ = _torchair_fia(q_t, k_t, v_t, **fia_kwargs)
+    else:
+        out, _ = torch_npu.npu_fused_infer_attention_score(q_t, k_t, v_t, **fia_kwargs)
+
+    if query.dim() == 4:
+        out = out.unsqueeze(0).contiguous()
     return out, None
 
 

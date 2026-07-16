@@ -14,7 +14,8 @@ from torch_npu.profiler import (
 )
 
 
-def run_with_profiling(compiled_model, inputs, output_dir="./prof_output", level="level1"):
+def run_with_profiling(compiled_model, inputs, output_dir="./prof_output", level="level1",
+                       num_iters=100):
     """先 warmup 触发图编译, 再正式采集 profiling 数据。
 
     Args:
@@ -22,9 +23,10 @@ def run_with_profiling(compiled_model, inputs, output_dir="./prof_output", level
         inputs: 模型输入 dict
         output_dir: profiling 输出目录
         level: profiling 等级, "level0" (基础) 或 "level1" (含 OP Type/Shapes)
+        num_iters: 正式采集的推理轮数
 
     Returns:
-        logits: 正式推理的输出 logits
+        logits: 最后一轮推理的输出 logits
     """
     # ---- Warmup：触发图编译，不采集 profiling ----
     print("=== Warmup (触发图编译，不采集) ===")
@@ -43,15 +45,16 @@ def run_with_profiling(compiled_model, inputs, output_dir="./prof_output", level
     )
 
     # ---- 正式采集 ----
-    print(f"=== Profiling 采集中 (level={level}) ===")
+    print(f"=== Profiling 采集中 (level={level}, iters={num_iters}) ===")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         on_trace_ready=tensorboard_trace_handler(output_dir),
         experimental_config=experimental_config,
     ):
         with torch.no_grad():
-            logits = compiled_model(**inputs).logits
-        torch.npu.synchronize()
-    print(f"=== Profiling 采集完成, 数据保存到 {output_dir} ===\n")
+            for i in range(num_iters):
+                logits = compiled_model(**inputs).logits
+            torch.npu.synchronize()
+    print(f"=== Profiling 采集完成 ({num_iters} 轮), 数据保存到 {output_dir} ===\n")
 
     return logits

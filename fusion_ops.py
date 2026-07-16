@@ -33,20 +33,16 @@ def _npu_rms_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 def _npu_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     """用 npu_rotary_mul 融合算子替代 rotate_half + Mul + Add。
 
-    原始: cos.unsqueeze → rotate_half(StridedSlice+Neg+Cat) → Mul → Add (×2 for q,k)
-    融合: npu_rotary_mul(q, cos, sin, 'half') → 1 个算子 (×2 for q,k)
-
-    npu_rotary_mul 半旋转模式:
-        x1, x2 = chunk(input, 2, -1)
-        x_new = cat((-x2, x1), dim=-1)
-        output = cos * input + sin * x_new
-    等价于 transformers 的 rotate_half 实现。
+    q/k 为 TND [T, N, D] 格式 (由 _patched_attention_forward 产出)。
+    cos/sin 为 [1, T, D], 转换为 [1, T, 1, D] 供 RotaryMul (要求 4D 输入)。
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+    cos = cos.squeeze(0).unsqueeze(1).unsqueeze(0)
+    sin = sin.squeeze(0).unsqueeze(1).unsqueeze(0)
+    q = q.unsqueeze(0)
+    k = k.unsqueeze(0)
     q_embed = torch_npu.npu_rotary_mul(q, cos, sin, 'half')
     k_embed = torch_npu.npu_rotary_mul(k, cos, sin, 'half')
-    return q_embed, k_embed
+    return q_embed.squeeze(0), k_embed.squeeze(0)
 
 
 # ==================== 3. RoPE cos/sin → 图外预计算 ====================
@@ -71,6 +67,9 @@ def _prepare_ffn_weights(model):
 
     swiglu 验证确认: weight1 = cat([up_w.T, gate_w.T], dim=1)
     npu_ffn 内部: silu(second_half) * first_half = silu(x@gate) * (x@up)
+
+    使用 register_buffer 注册权重, 使 dynamo 将其视为模型常量 (而非图输入),
+    避免动态导出时权重维度被标记为动态。
     """
     for layer in model.model.layers:
         mlp = layer.mlp
@@ -78,8 +77,8 @@ def _prepare_ffn_weights(model):
             [mlp.up_proj.weight.T, mlp.gate_proj.weight.T], dim=1
         ).contiguous()
         w2 = mlp.down_proj.weight.T.contiguous()
-        mlp._ffn_w1 = w1
-        mlp._ffn_w2 = w2
+        mlp.register_buffer('_ffn_w1', w1)
+        mlp.register_buffer('_ffn_w2', w2)
 
 
 def _npu_ffn_forward(self, x):

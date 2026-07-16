@@ -72,7 +72,7 @@ def setup_varlen_attention(model, cum_seq_lens, device):
     asl_tensor = torch.tensor(cum_seq_lens, dtype=torch.int64, device=device)
     for layer in model.model.layers:
         layer.self_attn.actual_seq_lengths_tensor = asl_tensor
-        layer.self_attn.atten_mask = atten_mask
+        layer.self_attn.register_buffer('atten_mask', atten_mask)
     model.model._update_causal_mask = lambda *a, **kw: None
 
     # 图外预计算 cos/sin
