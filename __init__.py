@@ -7,10 +7,8 @@ Qwen2.5 varlen 搜索相关性推理 — PyTorch(NPU融合算子) → AIR → OM
     fusion_ops.py         — 融合算子替换 (RMSNorm/RoPE/SwiGLU → NPU 融合算子)
     export_air.py         — AIR 导出 (torchair.dynamo_export) + ATC 编译
     prepare_air_inputs.py — 生成 OM 推理输入数据 + golden logits
-    run_infer.py          — PyTorch 推理入口 (eager/graph_fused + profiling)
-    profiling.py          — Profiling 采集封装
 """
 
 from .attention import register_npu_fia, build_causal_mask_2048
-from .varlen_utils import prepare_varlen_inputs, setup_varlen_attention
+from .varlen_utils import generate_varlen_inputs, setup_varlen_attention
 from .fusion_ops import apply_fusion_ops

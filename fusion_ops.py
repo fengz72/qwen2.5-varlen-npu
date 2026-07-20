@@ -3,7 +3,7 @@
 
 替换项:
     1. RMSNorm:  Pow + ReduceMean + Add + Rsqrt + Mul + Cast → npu_rms_norm
-    2. RoPE:     rotate_half(StridedSlice + Neg + Cat) + Mul + Add → npu_rotary_mul
+    2. RoPE:     rotate_half(StridedSlice + Neg + Cat) + Mul + Add → npu_apply_rotary_pos_emb
     3. RoPE cos/sin: 图内 Cast(206us) + MatMul + Cos + Sin → 图外预计算注入
     4. FFN:      2 MatMul + Cat + SwiGLU + MatMul → npu_ffn (swiglu)
 
@@ -28,21 +28,27 @@ def _npu_rms_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
 
 
-# ==================== 2. RoPE rotate → npu_rotary_mul ====================
+# ==================== 2. RoPE rotate → npu_apply_rotary_pos_emb ====================
 
 def _npu_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """用 npu_rotary_mul 融合算子替代 rotate_half + Mul + Add。
+    """用 npu_apply_rotary_pos_emb 融合算子替代 2×npu_rotary_mul。
 
     q/k 为 TND [T, N, D] 格式 (由 _patched_attention_forward 产出)。
-    cos/sin 为 [1, T, D], 转换为 [1, T, 1, D] 供 RotaryMul (要求 4D 输入)。
+    cos/sin 为 [1, T, D], 转换为 [T, 1, D] 供算子使用。
+    npu_apply_rotary_pos_emb 一次调用同时处理 Q 和 K, 原生支持 3D TND 布局,
+    无需手动 unsqueeze/squeeze 到 4D。
+
+    注意: GE 图编译时 ApplyRotaryPosEmb 可能返回 4D [1,T,N,D] 而非 3D [T,N,D],
+    需显式 reshape 回输入 shape, 否则下游 FIA 的 num_heads 推断错误。
     """
-    cos = cos.squeeze(0).unsqueeze(1).unsqueeze(0)
-    sin = sin.squeeze(0).unsqueeze(1).unsqueeze(0)
-    q = q.unsqueeze(0)
-    k = k.unsqueeze(0)
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin, 'half')
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin, 'half')
-    return q_embed.squeeze(0), k_embed.squeeze(0)
+    cos = cos.squeeze(0).unsqueeze(1)   # [1, T, D] → [T, 1, D]
+    sin = sin.squeeze(0).unsqueeze(1)
+    q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(
+        q, k, cos, sin, layout="TND", rotary_mode="half"
+    )
+    q_embed = q_embed.reshape(-1, q.size(1), q.size(2))
+    k_embed = k_embed.reshape(-1, k.size(1), k.size(2))
+    return q_embed, k_embed
 
 
 # ==================== 3. RoPE cos/sin → 图外预计算 ====================
@@ -112,7 +118,7 @@ def apply_fusion_ops(model=None):
 
     # 2. RoPE rotate
     modeling_qwen2.apply_rotary_pos_emb = _npu_apply_rotary_pos_emb
-    print("[fusion] apply_rotary_pos_emb → npu_rotary_mul")
+    print("[fusion] apply_rotary_pos_emb → npu_apply_rotary_pos_emb")
 
     # 3. RoPE cos/sin 图外预计算
     modeling_qwen2.Qwen2RotaryEmbedding.forward = _npu_rotary_emb_forward
@@ -124,42 +130,4 @@ def apply_fusion_ops(model=None):
     modeling_qwen2.Qwen2MLP.forward = _npu_ffn_forward
     print("[fusion] Qwen2MLP.forward → npu_ffn (swiglu)")
 
-    if model is not None:
-        _patch_model_instances(model)
 
-
-def _patch_model_instances(model):
-    """对已实例化的模型, 替换其 forward 方法绑定。
-
-    monkey-patch 类方法后, 已实例化的对象会自动引用新方法,
-    但显式绑定可确保在极端情况下 (如方法被复制) 也生效。
-    """
-    import types
-
-    # 遍历所有 decoder layer
-    layers = getattr(model.model, 'layers', [])
-    for layer in layers:
-        # RMSNorm
-        if hasattr(layer, 'input_layernorm'):
-            layer.input_layernorm.forward = types.MethodType(
-                _npu_rms_norm_forward, layer.input_layernorm
-            )
-        if hasattr(layer, 'post_attention_layernorm'):
-            layer.post_attention_layernorm.forward = types.MethodType(
-                _npu_rms_norm_forward, layer.post_attention_layernorm
-            )
-        # MLP
-        if hasattr(layer, 'mlp'):
-            layer.mlp.forward = types.MethodType(_npu_ffn_forward, layer.mlp)
-
-    # 最终 norm
-    if hasattr(model.model, 'norm'):
-        model.model.norm.forward = types.MethodType(
-            _npu_rms_norm_forward, model.model.norm
-        )
-
-    # Rotary embedding
-    if hasattr(model.model, 'rotary_emb'):
-        model.model.rotary_emb.forward = types.MethodType(
-            _npu_rotary_emb_forward, model.model.rotary_emb
-        )

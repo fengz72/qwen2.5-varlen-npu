@@ -1,7 +1,7 @@
 """
 导出 AIR 模型 — PyTorch(NPU融合算子) → torchair.dynamo_export → AIR → ATC → OM
 
-导出链路: PyTorch → AIR → OM (跳过 ONNX)
+导出链路: PyTorch → AIR → OM
 直接保留 NPU 融合算子 (FusedInferAttentionScore, FFN, RmsNorm, RotaryMul)。
 
 用法:
@@ -20,12 +20,12 @@ import torch
 import torch.nn as nn
 import torch_npu
 from torch_npu.dynamo.torchair import dynamo_export, CompilerConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2 import modeling_qwen2
 
 from .attention import register_npu_fia
-from .varlen_utils import prepare_varlen_inputs, setup_varlen_attention
+from .varlen_utils import generate_varlen_inputs, setup_varlen_attention
 from .fusion_ops import apply_fusion_ops
 
 
@@ -69,14 +69,11 @@ def patch_attention_for_dynamic():
     print("[patch] Qwen2Attention.forward → 动态导出版 (2D 模式, reshape 用 -1 避免 Pack)")
 
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
-DEFAULT_OUTPUT_DIR = "./export_air"
+DEFAULT_MODEL_NAME = "qwen2.5-0.5b"
+DEFAULT_OUTPUT_DIR = "atb/models/qwen2.5-0.5b/air"
+DEFAULT_OM_DIR = "atb/models/qwen2.5-0.5b/om"
 DEFAULT_SOC = "Ascend910_9382"
 DEFAULT_DEVICE = 8
-
-LONG_TEXT_TEMPLATE = (
-    "请详细介绍人工智能的发展历史，从图灵测试开始，到深度学习的兴起，"
-    "再到大语言模型的爆发。重点关注每个阶段的关键技术突破和代表性工作。"
-)
 
 
 class ExportWrapper(nn.Module):
@@ -87,7 +84,7 @@ class ExportWrapper(nn.Module):
 
     动态输入 (forward 参数, 成为图 Data 节点):
         input_ids:            [T] int64 — 所有 token 拼接 (T 动态)
-        position_ids:         [T] int64 — 对应 position ids (T 动态)
+        position_ids:         [T] int64 — 对应 position ids (T 动态, 图中消除)
         actual_seq_lengths:   [num_batch] int64 — 累积序列长度 (num_batch 动态)
         cos:                  [1, T, 64] float16 — RoPE cos (T 动态)
         sin:                  [1, T, 64] float16 — RoPE sin (T 动态)
@@ -130,18 +127,7 @@ class ExportWrapper(nn.Module):
         return self.model.lm_head(last_hidden)
 
 
-def generate_input_texts(batch_size, seq_len):
-    """生成指定 batch_size 和近似 seq_len 的输入文本列表。"""
-    if batch_size <= 0:
-        return ["你好"]
-    base = LONG_TEXT_TEMPLATE
-    base_tokens = len(base) // 2
-    repeat = max(1, seq_len // base_tokens)
-    text = (base * repeat)[:seq_len * 2]
-    return [text] * batch_size
-
-
-def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=False):
+def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=False, export_name="qwen2.5-0.5b"):
     """导出 AIR 模型。
 
     流程:
@@ -162,7 +148,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
     torch.npu.set_device(device)
     logging.getLogger('torchair').setLevel(logging.INFO)
 
-    # 1. 加载模型 (与 run_infer.py graph_fused 模式一致)
+    # 1. 加载模型 (NPU, npu_fia, fp16)
     register_npu_fia()
     print(f"=== 加载模型 (attn_implementation='npu_fia', device={device}) ===")
     model = AutoModelForCausalLM.from_pretrained(
@@ -178,10 +164,10 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
     # 2.1 patch attention forward, 用 -1 替代 q_len 避免 Pack
     patch_attention_for_dynamic()
 
-    # 3. 准备 varlen 输入
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    input_texts = generate_input_texts(batch_size, seq_len)
-    concat_ids, concat_pos, seq_lens, cum_seq_lens = prepare_varlen_inputs(tokenizer, input_texts)
+    # 3. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
+    concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
+        batch_size, seq_len
+    )
     setup_varlen_attention(model, cum_seq_lens, 'npu')
 
     print(f"  batch_size={batch_size}, total_tokens={sum(seq_lens)}, "
@@ -217,7 +203,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
 
     # 7. 导出 AIR
     os.makedirs(output_dir, exist_ok=True)
-    export_name = "qwen_varlen"
+    export_name = export_name
 
     print(f"=== 导出 AIR: {output_dir}/{export_name}.air ===")
     print(f"  dynamic={dynamic}")
@@ -270,7 +256,7 @@ def verify_air(air_dir):
         ("FusedInferAttentionScore", 24, "推理 Attention 融合算子"),
         ("FFN", 24, "MLP 融合算子"),
         ("RmsNorm", 49, "RMSNorm 融合算子 (24层×2 + 1 final)"),
-        ("RotaryMul", 48, "RoPE 融合算子 (24层×2 q/k)"),
+        ("ApplyRotaryPosEmb", 24, "RoPE 融合算子 (24层, Q+K 一次调用)"),
         ("MatMulV2", 72, "Q/K/V projection (24层×3)"),
         ("MatMul", 25, "O_proj + lm_head (24+1)"),
     ]
@@ -289,17 +275,20 @@ def verify_air(air_dir):
     print()
 
 
-def run_atc(air_path, output_dir, soc, input_shape=None):
+def run_atc(air_path, om_dir, soc, input_shape=None):
     """执行 ATC 命令将 AIR 编译为 OM。
 
     --framework=1 表示输入为 AIR 格式 (GE 原生图格式)。
+    OM 输出到 om_dir 目录, 文件名与 AIR 相同。
     """
-    om_path = air_path.replace(".air", "")
+    os.makedirs(om_dir, exist_ok=True)
+    air_basename = os.path.splitext(os.path.basename(air_path))[0]
+    om_output = os.path.join(om_dir, air_basename)
 
     cmd = (
         f"atc --framework=1"
         f" --model={air_path}"
-        f" --output={om_path}"
+        f" --output={om_output}"
         f" --soc_version={soc}"
     )
     if input_shape:
@@ -318,9 +307,9 @@ def run_atc(air_path, output_dir, soc, input_shape=None):
         print(result.stderr[-3000:])
         return None
 
-    om_file = om_path + ".om"
+    om_file = om_output + ".om"
     if not os.path.exists(om_file):
-        candidates = glob.glob(f"{om_path}*.om")
+        candidates = glob.glob(f"{om_output}*.om")
         if candidates:
             om_file = candidates[0]
         else:
@@ -335,10 +324,12 @@ def run_atc(air_path, output_dir, soc, input_shape=None):
 def main():
     parser = argparse.ArgumentParser(description="导出 AIR 模型 (torchair.dynamo_export)")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="模型路径")
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="导出模型名称 (AIR/OM 文件名)")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="AIR 输出目录")
+    parser.add_argument("--om-dir", default=DEFAULT_OM_DIR, help="OM 输出目录")
     parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
     parser.add_argument("--batch-size", type=int, default=10, help="batch size")
-    parser.add_argument("--seq-len", type=int, default=208, help="每条文本近似 token 数")
+    parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数")
     parser.add_argument("--dynamic", action="store_true", help="导出动态 shape")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
     parser.add_argument("--run-atc", action="store_true", default=False, help="自动执行 ATC 编译")
@@ -353,6 +344,7 @@ def main():
         args.batch_size,
         args.seq_len,
         dynamic=args.dynamic,
+        export_name=args.model_name,
     )
 
     # 2. 验证算子
@@ -361,7 +353,7 @@ def main():
 
     # 3. ATC 编译
     if args.run_atc:
-        om_path = run_atc(air_path, args.output_dir, args.soc)
+        om_path = run_atc(air_path, args.om_dir, args.soc)
         if om_path:
             print(f"=== 全流程完成 ===")
             print(f"  AIR: {air_path}")

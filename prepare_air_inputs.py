@@ -8,27 +8,27 @@ OM 只有 4 个图输入 (Data 节点):
   - sin [1, T, 64] float16
   - input_ids [T] int64
 
+(position_ids 虽是 forward 参数, 但因 cos/sin 图外预计算而在图中消除)
+
 同时运行 eager 模式生成 golden logits 供精度对比。
 """
 
 import os
 import torch
 import torch_npu
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from qwen_varlen.attention import register_npu_fia
-from qwen_varlen.varlen_utils import prepare_varlen_inputs, setup_varlen_attention
+from qwen_varlen.varlen_utils import generate_varlen_inputs, setup_varlen_attention
 from qwen_varlen.fusion_ops import apply_fusion_ops
 from qwen_varlen.export_air import patch_attention_for_dynamic
 
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
-DEFAULT_OUTPUT_DIR = "atb/models/qwen_varlen_air_2d/input_data"
-DEFAULT_DEVICE = 0
+DEFAULT_OUTPUT_DIR = "atb/models/qwen2.5-0.5b/input_data"
+DEFAULT_DEVICE = 2
 
-LONG_TEXT = (
-    "请详细介绍人工智能的发展历史，从图灵测试开始，到深度学习的兴起，"
-    "再到大语言模型的爆发。重点关注每个阶段的关键技术突破和代表性工作。"
-)
+BATCH_SIZE = 10
+SEQ_LEN = 208
 
 
 def main():
@@ -44,14 +44,10 @@ def main():
     apply_fusion_ops(model)
     patch_attention_for_dynamic()
 
-    # 2. 准备 varlen 输入
-    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_PATH)
-    base_tokens = len(LONG_TEXT) // 2
-    repeat = max(1, 208 // base_tokens)
-    text = (LONG_TEXT * repeat)[:208 * 2]
-    input_texts = [text] * 10
-
-    concat_ids, concat_pos, seq_lens, cum_seq_lens = prepare_varlen_inputs(tokenizer, input_texts)
+    # 2. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
+    concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
+        BATCH_SIZE, SEQ_LEN
+    )
     setup_varlen_attention(model, cum_seq_lens, 'npu')
 
     print(f"seq_lens: {seq_lens[:5]}, cum_seq_lens: {cum_seq_lens}")
@@ -89,7 +85,7 @@ def main():
     os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
     list_lines = []
-    arg_names = ["arg0_1", "arg2_1", "arg4_1", "arg6_1"]
+    arg_names = ["arg1_1", "arg3_1", "arg5_1", "arg8_1"]
     for idx, (name, tensor) in enumerate(inputs):
         fname = f"{name}.bin"
         fpath = os.path.join(DEFAULT_OUTPUT_DIR, fname)
