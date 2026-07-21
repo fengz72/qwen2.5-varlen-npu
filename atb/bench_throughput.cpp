@@ -158,7 +158,8 @@ class RequestGenerator {
 public:
     RequestGenerator(unsigned seed, const CosSinTable& table)
         : rng_(seed), table_(table),
-          batch_dist_(BATCH_AVG, BATCH_STD) {}
+          batch_dist_(BATCH_AVG, BATCH_STD),
+          seq_log_dist_(SEQ_LOG_MEAN, SEQ_LOG_STD) {}
 
     Request generate(int req_id, TimePoint arrive_time) {
         Request req;
