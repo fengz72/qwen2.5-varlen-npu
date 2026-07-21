@@ -1,0 +1,43 @@
+# =============================================================================
+# Model: qwen2.5-0.5b (2D dynamic AIR export, Pack-free)
+# hidden_states 全程 2D [T, D], 消除 Pack 算子
+# 4 inputs: actual_seq_lengths + cos + sin + input_ids (权重已 frozen_parameter 冻结)
+# batch_size=10, seq_len=208, total_tokens=2080 (varlen packed)
+# 融合算子: npu_rms_norm + npu_ffn + npu_fused_infer_attention_score + npu_apply_rotary_pos_emb
+# RoPE cos/sin 图外预计算 (消除图内 Cast+MatMul+Cos+Sin 5个kernel)
+# =============================================================================
+
+MODEL_NAME=qwen2.5-0.5b
+MODEL_FILE=om/qwen2.5-0.5b_linux_aarch64.om
+FRAMEWORK=1
+SOC_VERSION=Ascend910_9382
+MODEL_TYPE=dynamic
+
+INPUT_COUNT=4
+
+INPUT_0_NAME=arg1_1
+INPUT_0_SHAPE=10
+INPUT_0_DTYPE=int64
+INPUT_0_FORMAT=ND
+INPUT_0_FILE=input_data/actual_seq_lengths.bin
+
+INPUT_1_NAME=arg3_1
+INPUT_1_SHAPE=1,2080,64
+INPUT_1_DTYPE=float16
+INPUT_1_FORMAT=ND
+INPUT_1_FILE=input_data/cos.bin
+INPUT_1_SHAPE_ATC=1,-1,64
+
+INPUT_2_NAME=arg5_1
+INPUT_2_SHAPE=1,2080,64
+INPUT_2_DTYPE=float16
+INPUT_2_FORMAT=ND
+INPUT_2_FILE=input_data/sin.bin
+INPUT_2_SHAPE_ATC=1,-1,64
+
+INPUT_3_NAME=arg8_1
+INPUT_3_SHAPE=2080
+INPUT_3_DTYPE=int64
+INPUT_3_FORMAT=ND
+INPUT_3_FILE=input_data/input_ids.bin
+INPUT_3_SHAPE_ATC=-1

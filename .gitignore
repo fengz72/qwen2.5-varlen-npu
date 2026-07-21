@@ -1,16 +1,33 @@
-# Python
+# ===== Python =====
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.npy
 
-# Profiling output
+# ===== C++ / CMake 构建产物 =====
+atb/build/
+kernel_meta/
+
+# ===== 运行时 dump / 输出 =====
+atb/dump_graph/
+fusion_result.json
+ge_check_op.json
 prof_output/
 prof_*/
 log/
 
-# IDE
+# ===== 模型编译产物与数据（体积大，可重新生成）=====
+atb/models/*/air/
+atb/models/*/om/
+atb/models/*/input_data/
+atb/models/*/output/
+atb/models/*/profiling_data/
+
+# ===== 会话日志 =====
+session-ses_*.md
+
+# ===== IDE / OS =====
 .vscode/
 .idea/
-
-# OS
+.joycode/
 .DS_Store
