@@ -110,6 +110,9 @@ static const int    BATCH_FIXED_VAL = 10;
 static const double SEQ_LOG_MEAN = 4.997;
 static const double SEQ_LOG_STD  = 0.167;
 
+static bool   g_seq_fixed = false;
+static int    g_seq_fixed_val = 208;
+
 // ============================================================================
 // Timing helpers
 // ============================================================================
@@ -239,8 +242,13 @@ public:
         std::vector<int> seq_lens(bs);
         int total = 0;
         for (int i = 0; i < bs; i++) {
-            int sl = (int)std::round(std::exp(seq_log_dist_(rng_)));
-            sl = std::max(1, std::min(MAX_SEQ_LEN, sl));
+            int sl;
+            if (g_seq_fixed) {
+                sl = g_seq_fixed_val;
+            } else {
+                sl = (int)std::round(std::exp(seq_log_dist_(rng_)));
+                sl = std::max(1, std::min(MAX_SEQ_LEN, sl));
+            }
             seq_lens[i] = sl;
             total += sl;
         }
@@ -743,6 +751,7 @@ static void print_usage(const char* prog) {
               << "  --requests <N>       Total requests across all threads (default: 10000)\n"
               << "  --device-id <id>     NPU device ID (default: 0)\n"
               << "  --warmup <N>         Warmup requests (default: 50)\n"
+              << "  --fixed-seq <len>    Fix all sequence lengths to <len> (default: random)\n"
               << "  --profiling          Enable CANN profiling (generates acl.json)\n"
               << "  --profiling_output <dir>  Profiling output directory (default: ./profiling_data)\n"
               << "  --profiling_no_task_time    Disable task_time collection\n"
@@ -778,6 +787,9 @@ int main(int argc, char* argv[]) {
             device_id = std::stoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::stoi(argv[++i]);
+        } else if (arg == "--fixed-seq" && i + 1 < argc) {
+            g_seq_fixed = true;
+            g_seq_fixed_val = std::stoi(argv[++i]);
         } else if (arg == "--profiling") {
             // handled by ParseProfilingConfig
         } else if (arg == "--profiling_output" && i + 1 < argc) {

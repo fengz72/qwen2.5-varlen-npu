@@ -130,7 +130,7 @@ def safe_float(val, default=0.0):
 # msprof wrapper commands
 # =============================================================================
 
-def run_msprof_parse(profiling_dir, msprof_path=None):
+def run_msprof_parse(profiling_dir, msprof_path=None, force=False):
     """Run msprof --parse on PROF_XXX directories."""
     if msprof_path is None:
         msprof_path = find_msprof()
@@ -144,6 +144,10 @@ def run_msprof_parse(profiling_dir, msprof_path=None):
         return False
 
     for prof_dir in prof_dirs:
+        output_dir = os.path.join(prof_dir, 'mindstudio_profiler_output')
+        if not force and os.path.isdir(output_dir):
+            print(f"[SKIP] {os.path.basename(prof_dir)} already parsed (use --force to re-parse)")
+            continue
         print(f"[INFO] Parsing: {os.path.basename(prof_dir)}")
         cmd = [msprof_path, '--parse=on', f'--output={prof_dir}']
         try:
@@ -159,7 +163,7 @@ def run_msprof_parse(profiling_dir, msprof_path=None):
     return True
 
 
-def run_msprof_export(profiling_dir, msprof_path=None):
+def run_msprof_export(profiling_dir, msprof_path=None, force=False):
     """Run msprof --export on PROF_XXX directories."""
     if msprof_path is None:
         msprof_path = find_msprof()
@@ -173,6 +177,11 @@ def run_msprof_export(profiling_dir, msprof_path=None):
         return False
 
     for prof_dir in prof_dirs:
+        if not force:
+            exported = find_exported_csv(prof_dir)
+            if exported.get('op_summary'):
+                print(f"[SKIP] {os.path.basename(prof_dir)} already exported (use --force to re-export)")
+                continue
         print(f"[INFO] Exporting: {os.path.basename(prof_dir)}")
         cmd = [msprof_path, '--export=on', f'--output={prof_dir}']
         try:
@@ -219,17 +228,17 @@ def run_msprof_query(profiling_dir, msprof_path=None):
 # Analysis commands
 # =============================================================================
 
-def cmd_parse_and_export(profiling_dir, msprof_path=None):
+def cmd_parse_and_export(profiling_dir, msprof_path=None, force=False):
     """Run parse + export in one step."""
     print("=" * 80)
     print("Step 1: Parse profiling data")
     print("=" * 80)
-    run_msprof_parse(profiling_dir, msprof_path)
+    run_msprof_parse(profiling_dir, msprof_path, force=force)
     print()
     print("=" * 80)
     print("Step 2: Export profiling data")
     print("=" * 80)
-    run_msprof_export(profiling_dir, msprof_path)
+    run_msprof_export(profiling_dir, msprof_path, force=force)
 
 
 def cmd_list(profiling_dir):
@@ -623,16 +632,19 @@ Examples:
     p = subparsers.add_parser('parse', help='Run msprof --parse')
     p.add_argument('--profiling_dir', type=str, default='./profiling_data')
     p.add_argument('--msprof', type=str, default=None, help='Path to msprof binary')
+    p.add_argument('--force', action='store_true', help='Re-parse even if already parsed')
 
     # export
     p = subparsers.add_parser('export', help='Run msprof --export')
     p.add_argument('--profiling_dir', type=str, default='./profiling_data')
     p.add_argument('--msprof', type=str, default=None)
+    p.add_argument('--force', action='store_true', help='Re-export even if already exported')
 
     # parse-and-export
     p = subparsers.add_parser('parse-and-export', help='Run parse + export in one step')
     p.add_argument('--profiling_dir', type=str, default='./profiling_data')
     p.add_argument('--msprof', type=str, default=None)
+    p.add_argument('--force', action='store_true', help='Re-parse and re-export even if already done')
 
     # query
     p = subparsers.add_parser('query', help='Run msprof --query')
@@ -682,11 +694,11 @@ Examples:
         return 1
 
     if args.command == 'parse':
-        run_msprof_parse(args.profiling_dir, args.msprof)
+        run_msprof_parse(args.profiling_dir, args.msprof, force=args.force)
     elif args.command == 'export':
-        run_msprof_export(args.profiling_dir, args.msprof)
+        run_msprof_export(args.profiling_dir, args.msprof, force=args.force)
     elif args.command == 'parse-and-export':
-        cmd_parse_and_export(args.profiling_dir, args.msprof)
+        cmd_parse_and_export(args.profiling_dir, args.msprof, force=args.force)
     elif args.command == 'query':
         run_msprof_query(args.profiling_dir, args.msprof)
     elif args.command == 'list':
