@@ -5,7 +5,11 @@
     1. RMSNorm:  Pow + ReduceMean + Add + Rsqrt + Mul + Cast → npu_rms_norm
     2. RoPE:     rotate_half(StridedSlice + Neg + Cat) + Mul + Add → npu_apply_rotary_pos_emb
     3. RoPE cos/sin: 图内 Cast(206us) + MatMul + Cos + Sin → 图外预计算注入
-    4. FFN:      2 MatMul + Cat + SwiGLU + MatMul → npu_ffn (swiglu)
+
+注意: FFN 不使用 npu_ffn 融合。测试表明 npu_ffn (FFNV3) 的 tiling 策略对
+      [2080,896]→[9728]→[4864]→[896] shape 不优, MAC 利用率仅 43.5%,
+      拆分为独立 MatMul 后可达 85%, 整体 MLP 提速 16.4%。
+      详见 docs/ffn_fusion_optimization.md
 
 用法:
     from qwen_varlen.fusion_ops import apply_fusion_ops
@@ -62,44 +66,6 @@ def _npu_rotary_emb_forward(self, x, position_ids):
     return self._cached_cos, self._cached_sin
 
 
-# ==================== 4. FFN → npu_ffn (swiglu) ====================
-
-def _prepare_ffn_weights(model):
-    """预拼接 MLP 权重, 注入到每个 layer。
-
-    nn.Linear weight: [out_features, in_features]
-    npu_ffn weight1: [K, N] = [hidden, 2*intermediate]
-    npu_ffn weight2: [K, N] = [intermediate, hidden]
-
-    swiglu 验证确认: weight1 = cat([up_w.T, gate_w.T], dim=1)
-    npu_ffn 内部: silu(second_half) * first_half = silu(x@gate) * (x@up)
-
-    使用 register_buffer 注册权重, 使 dynamo 将其视为模型常量 (而非图输入),
-    避免动态导出时权重维度被标记为动态。
-    """
-    for layer in model.model.layers:
-        mlp = layer.mlp
-        w1 = torch.cat(
-            [mlp.up_proj.weight.T, mlp.gate_proj.weight.T], dim=1
-        ).contiguous()
-        w2 = mlp.down_proj.weight.T.contiguous()
-        mlp.register_buffer('_ffn_w1', w1)
-        mlp.register_buffer('_ffn_w2', w2)
-
-
-def _npu_ffn_forward(self, x):
-    """用 npu_ffn 融合整个 MLP: 2 MatMul + Cat + SwiGLU + MatMul → 1 个算子。
-
-    原始: gate_proj(x) → up_proj(x) → cat → swiglu → down_proj
-    融合: npu_ffn(x, w1, w2, 'swiglu') → 1 个算子
-    """
-    return torch_npu.npu_ffn(
-        x, self._ffn_w1, self._ffn_w2,
-        activation='swiglu',
-        inner_precise=1,
-    )
-
-
 # ==================== 统一入口 ====================
 
 def apply_fusion_ops(model=None):
@@ -123,11 +89,5 @@ def apply_fusion_ops(model=None):
     # 3. RoPE cos/sin 图外预计算
     modeling_qwen2.Qwen2RotaryEmbedding.forward = _npu_rotary_emb_forward
     print("[fusion] Qwen2RotaryEmbedding.forward → 图外预计算 cos/sin")
-
-    # 4. FFN (npu_ffn 融合整个 MLP)
-    if model is not None:
-        _prepare_ffn_weights(model)
-    modeling_qwen2.Qwen2MLP.forward = _npu_ffn_forward
-    print("[fusion] Qwen2MLP.forward → npu_ffn (swiglu)")
 
 

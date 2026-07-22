@@ -132,14 +132,14 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
 
     流程:
       1. 加载模型 (NPU, npu_fia, fp16) — 与 graph_fused 推理模式一致
-      2. 应用融合算子 (RMSNorm + RoPE + FFN)
+      2. 应用融合算子 (RMSNorm + RoPE)
       3. 设置 varlen 参数 (actual_seq_lengths, atten_mask, cos/sin 预计算)
       4. 包装模型 (ExportWrapper, 只返回 logits)
       5. dynamo_export 导出 AIR
 
     Args:
         model_path:  模型路径
-        output_dir:  输出目录
+        output_dir:  AIR 输出目录
         device:      NPU 设备号
         batch_size:  batch size
         seq_len:     每条文本近似 token 数
@@ -254,11 +254,13 @@ def verify_air(air_dir):
 
     ops_to_check = [
         ("FusedInferAttentionScore", 24, "推理 Attention 融合算子"),
-        ("FFN", 24, "MLP 融合算子"),
+        ("FFN", 0, "MLP 融合算子 (不应出现, 使用小算子)"),
         ("RmsNorm", 49, "RMSNorm 融合算子 (24层×2 + 1 final)"),
         ("ApplyRotaryPosEmb", 24, "RoPE 融合算子 (24层, Q+K 一次调用)"),
         ("MatMulV2", 72, "Q/K/V projection (24层×3)"),
-        ("MatMul", 25, "O_proj + lm_head (24+1)"),
+        ("MatMul", 97, "gate+up+down+O_proj+lm_head (24×3+24+1)"),
+        ("Mul", 24, "SwiGLU: silu(gate)*up (24层)"),
+        ("Swish", 24, "SwiGLU activation (24层)"),
     ]
 
     print("=== AIR 算子验证 ===")
