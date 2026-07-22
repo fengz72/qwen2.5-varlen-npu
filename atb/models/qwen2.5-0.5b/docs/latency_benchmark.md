@@ -1,13 +1,25 @@
 # Qwen2.5-0.5B 延迟与吞吐测试报告 (独立线程闭环模型)
 
 > 测试日期: 2026-07-21
-> 测试环境: Ascend910_9382, NPU device 2
+> 测试环境: Ascend910_9382, NPU device 14
 > 模型: qwen2.5-0.5b (varlen, 2D TND, frozen_parameter, fp16)
 > 测试工具: `atb/build/bench_latency`
 
 ## 1. 测试背景
 
-### 1.1 与 bench_throughput 的区别
+### 1.1 Bug 修复说明
+
+本次测试修复了 `bench_latency.cpp` 中 `RequestGenerator` 的一个 bug: `seq_log_dist_` 成员未用 `SEQ_LOG_MEAN` / `SEQ_LOG_STD` 初始化, 导致其使用 `std::normal_distribution` 的默认参数 (mean=0, stddev=1), 实际生成的 seq_len 服从 lognormal(0, 1) 而非预期的 lognormal(4.997, 0.167)。
+
+| | 修复前 (bug) | 修复后 |
+|---|---|---|
+| 分布 | lognormal(0, 1) | lognormal(4.997, 0.167) |
+| 平均 seq_len | ~1.87 | ~150 |
+| 每请求 total_tokens (batch=10) | ~19 | ~1500 |
+
+修复前所有测试数据均不可靠 (Execute 仅 ~5ms, Token/s 仅 ~3700), 修复后与 `main.cpp` profiling 的 ~17ms (batch=10, seq_len=208, total_tokens=2080) 吻合。
+
+### 1.2 与 bench_throughput 的区别
 
 | 特性 | bench_throughput (开环) | bench_latency (闭环) |
 |------|------------------------|---------------------|
@@ -18,14 +30,14 @@
 | 延迟含义 | 含 Queue Wait | 无 Queue Wait, 纯单请求耗时 |
 | 吞吐含义 | 压满场景的最大 QPS | N 个独立请求源的实际吞吐 |
 
-### 1.2 测试目标
+### 1.3 测试目标
 
 - 测量单请求真实 E2E 延迟 (含 D2H, 无队列等待)
 - 拆分延迟为 Data Gen / H2D / Execute / D2H 四阶段
 - 找到独立线程模型下的吞吐饱和点与延迟拐点
 - 与 bench_throughput 结果对比, 评估队列等待的影响
 
-### 1.3 架构
+### 1.4 架构
 
 ```
 main()
@@ -46,7 +58,7 @@ main()
   └── 打印 sweep 对比表
 ```
 
-### 1.4 延迟拆分
+### 1.5 延迟拆分
 
 | 时间点 | 阶段 | 说明 |
 |--------|------|------|
@@ -65,7 +77,7 @@ seq_len:           lognormal(4.997, 0.167), clipped [1, 218]  → avg≈150, p99
 cos/sin:           预计算 [218, 64] 表, 按 position_ids gather
 warmup:            50 requests
 total_requests:    8000 (每个线程 requests/threads 次)
-device_id:         2
+device_id:         14
 线程数 sweep:      1, 2, 3, 4, 5, 6, 7, 8
 每线程独立模型实例: 是 (避免动态 shape 并发冲突)
 ```
@@ -76,14 +88,14 @@ device_id:         2
 
 | Threads | QPS | Token/s | Gen avg | H2D avg | Exec avg | Exec p99 | D2H avg | E2E avg | E2E p99 |
 |---------|-------|---------|---------|---------|----------|----------|---------|---------|---------|
-| 1 | 196.48 | 3,683 | 0.005 | 0.050 | 4.92 | 5.78 | 0.112 | 5.09 | 5.96 |
-| 2 | 239.64 | 4,493 | 0.005 | 0.055 | 8.17 | 9.05 | 0.111 | 8.34 | 9.24 |
-| 3 | 254.37 | 4,760 | 0.006 | 0.059 | 11.59 | 12.61 | 0.122 | 11.78 | 12.82 |
-| 4 | 256.20 | 4,798 | 0.007 | 0.072 | 15.38 | 16.74 | 0.133 | 15.60 | 16.96 |
-| 5 | 258.23 | 4,840 | 0.007 | 0.074 | 19.12 | 20.81 | 0.138 | 19.34 | 21.06 |
-| 6 | 258.50 | 4,873 | 0.007 | 0.076 | 22.97 | 25.03 | 0.138 | 23.19 | 25.25 |
-| 7 | **260.63** | **4,908** | 0.007 | 0.077 | 26.61 | 28.66 | 0.142 | 26.84 | 28.93 |
-| 8 | 260.04 | 4,896 | 0.008 | 0.077 | 30.52 | 32.55 | 0.142 | 30.75 | 32.77 |
+| 1 | 67.30 | 100,903 | 0.263 | 0.081 | 14.40 | 15.65 | 0.108 | 14.86 | 16.17 |
+| 2 | 79.31 | 118,854 | 0.267 | 0.089 | 24.73 | 26.57 | 0.124 | 25.21 | 27.09 |
+| 3 | 79.73 | 119,498 | 0.274 | 0.099 | 37.10 | 40.35 | 0.131 | 37.60 | 40.88 |
+| **4** | **80.01** | **119,874** | 0.279 | 0.104 | 49.44 | 53.96 | 0.140 | 49.96 | 54.52 |
+| 5 | 80.00 | 119,853 | 0.279 | 0.104 | 61.94 | 68.27 | 0.140 | 62.47 | 68.79 |
+| 6 | 79.46 | 119,138 | 0.280 | 0.105 | 74.94 | 82.74 | 0.138 | 75.46 | 83.33 |
+| 7 | 79.18 | 118,706 | 0.281 | 0.106 | 87.81 | 96.01 | 0.139 | 88.33 | 96.58 |
+| 8 | 79.07 | 118,546 | 0.281 | 0.108 | 100.58 | 107.88 | 0.140 | 101.11 | 108.40 |
 
 ### 3.2 关键指标趋势
 
@@ -91,66 +103,66 @@ device_id:         2
 
 | Threads | QPS | 相对 1 thread | 边际增益 |
 |---------|-----|--------------|---------|
-| 1 | 196.48 | 1.00× | - |
-| 2 | 239.64 | 1.22× | +43.16 |
-| 3 | 254.37 | 1.29× | +14.73 |
-| 4 | 256.20 | 1.30× | +1.83 |
-| 5 | 258.23 | 1.31× | +2.03 |
-| 6 | 258.50 | 1.32× | +0.27 |
-| 7 | 260.63 | 1.33× | +2.13 |
-| 8 | 260.04 | 1.32× | -0.59 |
+| 1 | 67.30 | 1.00× | - |
+| 2 | 79.31 | 1.18× | +12.01 |
+| 3 | 79.73 | 1.19× | +0.42 |
+| 4 | 80.01 | 1.19× | +0.28 |
+| 5 | 80.00 | 1.19× | -0.01 |
+| 6 | 79.46 | 1.18× | -0.54 |
+| 7 | 79.18 | 1.18× | -0.28 |
+| 8 | 79.07 | 1.17× | -0.11 |
 
 #### Execute 时间线性增长
 
 | Threads | Exec avg | 相对 1 thread |
 |---------|----------|--------------|
-| 1 | 4.92ms | 1.00× |
-| 2 | 8.17ms | 1.66× |
-| 3 | 11.59ms | 2.36× |
-| 4 | 15.38ms | 3.13× |
-| 5 | 19.12ms | 3.89× |
-| 6 | 22.97ms | 4.67× |
-| 7 | 26.61ms | 5.41× |
-| 8 | 30.52ms | 6.20× |
+| 1 | 14.40ms | 1.00× |
+| 2 | 24.73ms | 1.72× |
+| 3 | 37.10ms | 2.58× |
+| 4 | 49.44ms | 3.43× |
+| 5 | 61.94ms | 4.30× |
+| 6 | 74.94ms | 5.20× |
+| 7 | 87.81ms | 6.10× |
+| 8 | 100.58ms | 6.98× |
 
 #### 各阶段占比 (以 4 threads 为例)
 
 | 阶段 | avg (ms) | 占 E2E 比例 |
 |------|---------|------------|
-| Data Gen | 0.007 | 0.04% |
-| H2D | 0.072 | 0.46% |
-| **Execute** | **15.38** | **98.6%** |
-| D2H | 0.133 | 0.85% |
-| **E2E** | **15.60** | 100% |
+| Data Gen | 0.279 | 0.56% |
+| H2D | 0.104 | 0.21% |
+| **Execute** | **49.44** | **98.95%** |
+| D2H | 0.140 | 0.28% |
+| **E2E** | **49.96** | 100% |
 
 ## 4. 分析
 
-### 4.1 吞吐饱和点: 4 threads
+### 4.1 吞吐饱和点: 2 threads
 
 ```
-1 thread:  196 QPS
-2 threads: 240 QPS  (+22%)
-3 threads: 254 QPS  (+14%)
-4 threads: 256 QPS  (+1%)
-5 threads: 258 QPS  (+1%)
-6 threads: 259 QPS  (+0%)
-7 threads: 261 QPS  (+1%)  ← 峰值
-8 threads: 260 QPS  (-0%)
+1 thread:  67 QPS
+2 threads: 79 QPS  (+18%)
+3 threads: 80 QPS  (+0.5%)
+4 threads: 80 QPS  (+0.4%)
+5 threads: 80 QPS  (+0%)
+6 threads: 79 QPS  (-0.6%)
+7 threads: 79 QPS  (-0.3%)
+8 threads: 79 QPS  (-0.1%)
 ```
 
-NPU 计算资源在 **4 threads 时已接近打满**。4→8 threads QPS 仅从 256 增至 260 (+1.5%), 边际收益可忽略。7 threads 达到 QPS 峰值 261, 之后开始下降。
+NPU 计算资源在 **2 threads 时已接近打满**。2→8 threads QPS 仅从 79.31 增至 80.01 (+0.9%), 边际收益可忽略。4 threads 达到 QPS 峰值 80.01, 之后开始下降。
 
 ### 4.2 延迟线性劣化
 
 E2E avg 随线程数近乎线性增长:
 
 ```
-1 thread:  5.09ms   (独占 NPU)
-4 threads: 15.60ms  (×3.1)
-8 threads: 30.75ms  (×6.0)
+1 thread:  14.86ms   (独占 NPU)
+4 threads: 49.96ms   (×3.4)
+8 threads: 101.11ms  (×6.8)
 ```
 
-说明 4 threads 后设备已满载, 额外并发只是排队等待, 不产生并行收益。
+说明 2 threads 后设备已满载, 额外并发只是排队等待, 不产生并行收益。
 
 ### 4.3 Execute 主导 E2E
 
@@ -158,27 +170,21 @@ Execute 占 E2E 的 **96%+**, 是绝对瓶颈:
 
 | Threads | E2E avg | Execute avg | Execute 占比 |
 |---------|---------|-------------|-------------|
-| 1 | 5.09ms | 4.92ms | 96.7% |
-| 4 | 15.60ms | 15.38ms | 98.6% |
-| 8 | 30.75ms | 30.52ms | 99.2% |
+| 1 | 14.86ms | 14.40ms | 96.9% |
+| 4 | 49.96ms | 49.44ms | 99.0% |
+| 8 | 101.11ms | 100.58ms | 99.5% |
 
 Data Gen / H2D / D2H 合计占比 <4%, 且随线程数增长几乎不变, 说明这些阶段的并行性较好。
 
 ### 4.4 独立线程 vs Producer-Consumer 对比
 
-| Threads/Streams | 闭环 QPS (bench_latency) | 开环 QPS (bench_throughput) | 闭环 E2E avg | 开环 E2E avg |
-|-----------------|------------------------|---------------------------|-------------|-------------|
-| 1 | 196.48 | 201.53 | 5.09ms | 29.71ms |
-| 4 | 256.20 | 259.09 | 15.60ms | 80.61ms |
-| 8 | 260.04 | 259.96 | 30.75ms | 156.21ms |
+> **注意**: `bench_throughput` 存在同样的 seq_len bug, 以下旧数据不可靠, 待修复后重新测试对比。
 
-**关键发现:**
-
-1. **QPS 接近**: 两种模型吞吐相当 (差异 <3%), 说明 NPU 算力是真正瓶颈, 任务调度方式影响不大。
-2. **闭环 E2E 远低于开环**: 闭环无 Queue Wait, E2E = 纯单请求耗时; 开环含排队, E2E 被队列等待主导。
-   - 1 thread: 闭环 5ms vs 开环 30ms (6×差距, 排队占 83%)
-   - 8 threads: 闭环 31ms vs 开环 156ms (5×差距, 排队占 80%)
-3. **闭环更能反映单请求真实延迟**, 开环更能反映压满场景下的用户感知延迟。
+| Threads/Streams | 闭环 QPS (bench_latency, 修复后) | 开环 QPS (bench_throughput, 旧数据待重测) | 闭环 E2E avg | 开环 E2E avg (旧) |
+|-----------------|----------------------------------|------------------------------------------|-------------|-------------------|
+| 1 | 67.30 | 待重测 | 14.86ms | 待重测 |
+| 4 | 80.01 | 待重测 | 49.96ms | 待重测 |
+| 8 | 79.07 | 待重测 | 101.11ms | 待重测 |
 
 ### 4.5 D2H 开销分析
 
@@ -186,7 +192,7 @@ D2H 将 `[N, vocab]` fp16 输出 (batch=10, 151936 vocab) 从 device 拷回 host
 
 ```
 D2H 数据量 = 10 × 151936 × 2 = 3.04 MB
-D2H avg   = 0.11-0.14ms (随线程数微增)
+D2H avg   = 0.108-0.140ms (随线程数微增)
 ```
 
 D2H 占 E2E 比例 <1%, 对整体延迟影响可忽略。
@@ -195,55 +201,60 @@ D2H 占 E2E 比例 <1%, 对整体延迟影响可忽略。
 
 | Threads | Gen avg | H2D avg | Exec avg | D2H avg |
 |---------|---------|---------|----------|---------|
-| 1 | 0.005 | 0.050 | 4.92 | 0.112 |
-| 4 | 0.007 | 0.072 | 15.38 | 0.133 |
-| 8 | 0.008 | 0.077 | 30.52 | 0.142 |
+| 1 | 0.263 | 0.081 | 14.40 | 0.108 |
+| 4 | 0.279 | 0.104 | 49.44 | 0.140 |
+| 8 | 0.281 | 0.108 | 100.58 | 0.140 |
 
-- **Data Gen**: 几乎不变 (0.005→0.008ms), CPU 侧无竞争
-- **H2D**: 微增 (0.05→0.077ms), PCIe 带宽有轻微竞争
-- **Execute**: 线性增长 (4.92→30.52ms), NPU 算力分时复用
-- **D2H**: 微增 (0.11→0.14ms), PCIe 带宽有轻微竞争
+- **Data Gen**: 几乎不变 (0.263→0.281ms), CPU 侧无竞争
+- **H2D**: 微增 (0.081→0.108ms), PCIe 带宽有轻微竞争
+- **Execute**: 线性增长 (14.40→100.58ms), NPU 算力分时复用
+- **D2H**: 微增 (0.108→0.140ms), PCIe 带宽有轻微竞争
+
+### 4.7 Data Gen 开销分析
+
+修复后 Data Gen 从 ~0.005ms 增至 ~0.263ms, 因为 cos/sin gather 的数据量从 ~19 tokens 增至 ~1500 tokens (×80):
+
+```
+Data Gen = 采样 + gather cos/sin [total_tokens, 64]
+         = ~1500 × 64 × 2 (cos+sin) × float→fp16 转换
+         ≈ 0.263ms (1 thread)
+```
+
+Data Gen 占 E2E 比例 <2%, 对整体延迟影响可忽略。
 
 ## 5. 配置建议
 
-### 5.1 独立线程模型最优配置: 4 threads
+### 5.1 独立线程模型最优配置: 2 threads
 
 | Threads | QPS | E2E avg | E2E p99 | 评价 |
 |---------|-----|---------|---------|------|
-| 1 | 196 | 5ms | 6ms | 延迟最低, 吞吐未打满 |
-| **4** | **256** | **16ms** | **17ms** | **吞吐接近峰值, 延迟可控** |
-| 7 | 261 | 27ms | 29ms | QPS 峰值, 但延迟翻倍 |
-| 8 | 260 | 31ms | 33ms | 延续劣化, 无吞吐增益 |
+| 1 | 67 | 15ms | 16ms | 延迟最低, 吞吐未打满 |
+| **2** | **79** | **25ms** | **27ms** | **吞吐接近峰值, 延迟可控** |
+| 4 | 80 | 50ms | 55ms | QPS 峰值, 但延迟翻倍 |
+| 8 | 79 | 101ms | 108ms | 延迟劣化严重, 无吞吐增益 |
 
-选择 4 threads 的理由:
-1. **QPS 达峰值的 98%**: 256 vs 261 (差 2%, 可忽略)
-2. **E2E p99 仅 17ms**: 相比 7 threads 的 29ms 低 41%
-3. **Exec p99 16.7ms**: 单请求执行快, 响应迅速
-4. **超过 4 threads 收益递减**: QPS +1.5%, E2E p99 +72%
+选择 2 threads 的理由:
+1. **QPS 达峰值的 99%**: 79.31 vs 80.01 (差 0.9%, 可忽略)
+2. **E2E p99 仅 27ms**: 相比 4 threads 的 55ms 低 51%
+3. **Exec p99 26.6ms**: 单请求执行快, 响应迅速
+4. **超过 2 threads 收益递减**: QPS +0.9%, E2E p99 +104%
 
-### 5.2 与 bench_throughput 建议一致
+### 5.2 与 bench_throughput 建议对比
 
-两种测试模型均指向 **4 streams/threads 为最优配置**:
-
-| 测试模型 | 推荐 | QPS | E2E p99 |
-|---------|------|-----|---------|
-| 闭环 (bench_latency) | 4 threads | 256 | 17ms |
-| 开环 (bench_throughput) | 4 streams | 259 | 88ms |
-
-闭环 E2E p99 (17ms) 远低于开环 (88ms), 因为闭环无队列等待。实际在线服务更接近开环模型 (请求需排队), 但闭环数据可用于评估单请求处理能力上限。
+> `bench_throughput` 存在同样的 seq_len bug, 待修复后重新测试。旧数据不可靠, 此处暂不对比。
 
 ### 5.3 场景建议
 
 | 场景 | 推荐 threads | 理由 |
 |------|-------------|------|
-| **单请求低延迟** (在线交互) | 1-2 | E2E p99 < 10ms |
-| **吞吐+延迟平衡** (通用服务) | 4 | QPS 256, E2E p99 17ms |
-| **吞吐优先** (离线批量) | 7-8 | QPS 峰值 261 |
-| **资源受限** | 2-3 | QPS 254 (97% 峰值), 延迟可控 |
+| **单请求低延迟** (在线交互) | 1 | E2E p99 16ms, QPS 67 |
+| **吞吐+延迟平衡** (通用服务) | 2 | QPS 79, E2E p99 27ms |
+| **吞吐优先** (离线批量) | 4 | QPS 80 (峰值), E2E p99 55ms |
+| **资源受限** | 1-2 | 避免 HBM 不足导致 OOM |
 
 ### 5.4 一句话总结
 
-独立线程模型下, **4 threads 是 NPU 资源利用率与单请求延迟的最优平衡点**, QPS 达峰值 98%, E2E p99 仅 17ms。Execute 占 E2E 96%+, 是唯一值得优化的阶段。
+独立线程模型下, **2 threads 是 NPU 资源利用率与单请求延迟的最优平衡点**, QPS 达峰值 99%, E2E p99 仅 27ms。Execute 占 E2E 97%+, 是唯一值得优化的阶段。
 
 ## 6. 测试命令
 
@@ -252,7 +263,7 @@ D2H 占 E2E 比例 <1%, 对整体延迟影响可忽略。
 ```bash
 atb/build/bench_latency \
     --model atb/models/qwen2.5-0.5b/om/qwen2.5-0.5b_linux_aarch64.om \
-    --threads 4 --requests 8000 --warmup 50 --device-id 2
+    --threads 2 --requests 8000 --warmup 50 --device-id 14
 ```
 
 ### 6.2 Sweep 多个 thread 数
@@ -260,7 +271,7 @@ atb/build/bench_latency \
 ```bash
 atb/build/bench_latency \
     --model atb/models/qwen2.5-0.5b/om/qwen2.5-0.5b_linux_aarch64.om \
-    --sweep 1,2,3,4,5,6,7,8 --requests 8000 --warmup 50 --device-id 2
+    --sweep 1,2,3,4,5,6,7,8 --requests 8000 --warmup 50 --device-id 14
 ```
 
 ## 7. 附录 A: 各线程数详细数据
@@ -269,185 +280,185 @@ atb/build/bench_latency \
 
 ```
 Requests:         8000 (warmup=50)
-Total Time:       40715.98 ms
-Total Tokens:     149941
-QPS:              196.48 req/s
-Token Throughput: 3683 tokens/s
+Total Time:       118869.93 ms
+Total Tokens:     11994331
+QPS:              67.30 req/s
+Token Throughput: 100903 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=5.088  p50=5.054  p90=5.218  p99=5.965  max=6.897
-    Data Gen   avg=0.005  p50=0.004  p90=0.007  p99=0.012  max=0.047
-    H2D        avg=0.050  p50=0.050  p90=0.052  p99=0.062  max=1.107
-    Execute    avg=4.920  p50=4.887  p90=5.047  p99=5.782  max=6.493
-    D2H        avg=0.112  p50=0.110  p90=0.116  p99=0.128  max=0.826
+  E2E (full)   avg=14.857  p50=14.667  p90=15.731  p99=16.170  max=16.995
+    Data Gen   avg=0.263   p50=0.261   p90=0.282   p99=0.316   max=0.781
+    H2D        avg=0.081   p50=0.079   p90=0.089   p99=0.148   max=0.537
+    Execute    avg=14.404  p50=14.216  p90=15.259  p99=15.653  max=16.485
+    D2H        avg=0.108   p50=0.105   p90=0.117   p99=0.150   max=0.780
 ```
 
 ### 7.2 2 threads
 
 ```
 Requests:         8000 (warmup=50)
-Total Time:       33383.39 ms
-Total Tokens:     149984
-QPS:              239.64 req/s
-Token Throughput: 4493 tokens/s
+Total Time:       100873.67 ms
+Total Tokens:     11989283
+QPS:              79.31 req/s
+Token Throughput: 118854 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=8.343  p50=8.347  p90=8.572  p99=9.239  max=10.365
-    Data Gen   avg=0.005  p50=0.004  p90=0.007  p99=0.013  max=0.051
-    H2D        avg=0.055  p50=0.053  p90=0.058  p99=0.094  max=0.487
-    Execute    avg=8.170  p50=8.178  p90=8.396  p99=9.046  max=9.939
-    D2H        avg=0.111  p50=0.109  p90=0.120  p99=0.149  max=0.335
+  E2E (full)   avg=25.213  p50=25.108  p90=26.337  p99=27.094  max=28.140
+    Data Gen   avg=0.267   p50=0.264   p90=0.290   p99=0.319   max=0.495
+    H2D        avg=0.089   p50=0.081   p90=0.118   p99=0.188   max=0.554
+    Execute    avg=24.732  p50=24.621  p90=25.834  p99=26.568  max=27.647
+    D2H        avg=0.124   p50=0.119   p90=0.145   p99=0.174   max=0.766
 
 Per-Thread E2E:
-  Thread 0: 4000 reqs, avg_e2e=8.341ms
-  Thread 1: 4000 reqs, avg_e2e=8.344ms
+  Thread 0: 4000 reqs, avg_e2e=25.212ms
+  Thread 1: 4000 reqs, avg_e2e=25.215ms
 ```
 
 ### 7.3 3 threads
 
 ```
 Requests:         8001 (warmup=50)
-Total Time:       31454.66 ms
-Total Tokens:     149733
-QPS:              254.37 req/s
-Token Throughput: 4760 tokens/s
+Total Time:       100353.03 ms
+Total Tokens:     11991964
+QPS:              79.73 req/s
+Token Throughput: 119498 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=11.776  p50=11.732  p90=12.223  p99=12.821  max=66.841
-    Data Gen   avg=0.006   p50=0.005   p90=0.008   p99=0.015   max=0.192
-    H2D        avg=0.059   p50=0.056   p90=0.066   p99=0.167   max=0.482
-    Execute    avg=11.588  p50=11.543  p90=12.024  p99=12.613  max=66.611
-    D2H        avg=0.122   p50=0.119   p90=0.138   p99=0.173   max=0.970
+  E2E (full)   avg=37.603  p50=37.232  p90=39.754  p99=40.877  max=64.286
+    Data Gen   avg=0.274   p50=0.273   p90=0.298   p99=0.335   max=0.581
+    H2D        avg=0.099   p50=0.093   p90=0.122   p99=0.202   max=0.446
+    Execute    avg=37.097  p50=36.730  p90=39.225  p99=40.349  max=63.785
+    D2H        avg=0.131   p50=0.130   p90=0.153   p99=0.189   max=0.874
 
 Per-Thread E2E:
-  Thread 0: 2667 reqs, avg_e2e=11.753ms
-  Thread 1: 2667 reqs, avg_e2e=11.784ms
-  Thread 2: 2667 reqs, avg_e2e=11.792ms
+  Thread 0: 2667 reqs, avg_e2e=37.598ms
+  Thread 1: 2667 reqs, avg_e2e=37.589ms
+  Thread 2: 2667 reqs, avg_e2e=37.623ms
 ```
 
 ### 7.4 4 threads
 
 ```
 Requests:         8000 (warmup=50)
-Total Time:       31225.27 ms
-Total Tokens:     149825
-QPS:              256.20 req/s
-Token Throughput: 4798 tokens/s
+Total Time:       99987.52 ms
+Total Tokens:     11985894
+QPS:              80.01 req/s
+Token Throughput: 119874 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=15.597  p50=15.575  p90=16.208  p99=16.963  max=19.711
-    Data Gen   avg=0.007   p50=0.006   p90=0.009   p99=0.019   max=0.221
-    H2D        avg=0.072   p50=0.062   p90=0.082   p99=0.298   max=0.660
-    Execute    avg=15.383  p50=15.367  p90=15.979  p99=16.739  max=19.279
-    D2H        avg=0.133   p50=0.128   p90=0.160   p99=0.200   max=0.824
+  E2E (full)   avg=49.964  p50=49.473  p90=52.704  p99=54.523  max=57.346
+    Data Gen   avg=0.279   p50=0.277   p90=0.301   p99=0.349   max=0.512
+    H2D        avg=0.104   p50=0.102   p90=0.122   p99=0.214   max=0.484
+    Execute    avg=49.440  p50=48.946  p90=52.165  p99=53.961  max=56.881
+    D2H        avg=0.140   p50=0.138   p90=0.164   p99=0.199   max=0.797
 
 Per-Thread E2E:
-  Thread 0: 2000 reqs, avg_e2e=15.593ms
-  Thread 1: 2000 reqs, avg_e2e=15.581ms
-  Thread 2: 2000 reqs, avg_e2e=15.604ms
-  Thread 3: 2000 reqs, avg_e2e=15.610ms
+  Thread 0: 2000 reqs, avg_e2e=49.986ms
+  Thread 1: 2000 reqs, avg_e2e=49.933ms
+  Thread 2: 2000 reqs, avg_e2e=49.952ms
+  Thread 3: 2000 reqs, avg_e2e=49.987ms
 ```
 
 ### 7.5 5 threads
 
 ```
 Requests:         8000 (warmup=50)
-Total Time:       30980.03 ms
-Total Tokens:     149956
-QPS:              258.23 req/s
-Token Throughput: 4840 tokens/s
+Total Time:       100004.95 ms
+Total Tokens:     11985878
+QPS:              80.00 req/s
+Token Throughput: 119853 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=19.345  p50=19.334  p90=20.152  p99=21.064  max=66.392
-    Data Gen   avg=0.007   p50=0.006   p90=0.009   p99=0.068   max=0.224
-    H2D        avg=0.074   p50=0.063   p90=0.084   p99=0.276   max=0.486
-    Execute    avg=19.125  p50=19.116  p90=19.927  p99=20.813  max=66.145
-    D2H        avg=0.138   p50=0.134   p90=0.167   p99=0.204   max=0.801
+  E2E (full)   avg=62.468  p50=61.881  p90=66.085  p99=68.789  max=72.267
+    Data Gen   avg=0.279   p50=0.276   p90=0.301   p99=0.379   max=0.723
+    H2D        avg=0.104   p50=0.101   p90=0.123   p99=0.222   max=0.549
+    Execute    avg=61.944  p50=61.359  p90=65.526  p99=68.265  max=71.713
+    D2H        avg=0.140   p50=0.137   p90=0.166   p99=0.199   max=4.131
 
 Per-Thread E2E:
-  Thread 0: 1600 reqs, avg_e2e=19.345ms
-  Thread 1: 1600 reqs, avg_e2e=19.340ms
-  Thread 2: 1600 reqs, avg_e2e=19.326ms
-  Thread 3: 1600 reqs, avg_e2e=19.355ms
-  Thread 4: 1600 reqs, avg_e2e=19.359ms
+  Thread 0: 1600 reqs, avg_e2e=62.495ms
+  Thread 1: 1600 reqs, avg_e2e=62.456ms
+  Thread 2: 1600 reqs, avg_e2e=62.462ms
+  Thread 3: 1600 reqs, avg_e2e=62.482ms
+  Thread 4: 1600 reqs, avg_e2e=62.446ms
 ```
 
 ### 7.6 6 threads
 
 ```
 Requests:         8004 (warmup=50)
-Total Time:       30963.17 ms
-Total Tokens:     150882
-QPS:              258.50 req/s
-Token Throughput: 4873 tokens/s
+Total Time:       100724.64 ms
+Total Tokens:     12000098
+QPS:              79.46 req/s
+Token Throughput: 119138 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=23.191  p50=23.175  p90=24.156  p99=25.252  max=26.971
-    Data Gen   avg=0.007   p50=0.006   p90=0.009   p99=0.059   max=0.184
-    H2D        avg=0.076   p50=0.064   p90=0.091   p99=0.315   max=0.549
-    Execute    avg=22.969  p50=22.955  p90=23.925  p99=25.029  max=26.779
-    D2H        avg=0.138   p50=0.134   p90=0.166   p99=0.204   max=0.894
+  E2E (full)   avg=75.464  p50=74.995  p90=79.356  p99=83.325  max=89.245
+    Data Gen   avg=0.280   p50=0.277   p90=0.303   p99=0.371   max=0.860
+    H2D        avg=0.105   p50=0.101   p90=0.125   p99=0.203   max=0.480
+    Execute    avg=74.938  p50=74.471  p90=78.787  p99=82.739  max=88.623
+    D2H        avg=0.138   p50=0.135   p90=0.166   p99=0.192   max=1.891
 
 Per-Thread E2E:
-  Thread 0: 1334 reqs, avg_e2e=23.193ms
-  Thread 1: 1334 reqs, avg_e2e=23.191ms
-  Thread 2: 1334 reqs, avg_e2e=23.161ms
-  Thread 3: 1334 reqs, avg_e2e=23.207ms
-  Thread 4: 1334 reqs, avg_e2e=23.194ms
-  Thread 5: 1334 reqs, avg_e2e=23.202ms
+  Thread 0: 1334 reqs, avg_e2e=75.486ms
+  Thread 1: 1334 reqs, avg_e2e=75.357ms
+  Thread 2: 1334 reqs, avg_e2e=75.495ms
+  Thread 3: 1334 reqs, avg_e2e=75.497ms
+  Thread 4: 1334 reqs, avg_e2e=75.487ms
+  Thread 5: 1334 reqs, avg_e2e=75.460ms
 ```
 
 ### 7.7 7 threads
 
 ```
 Requests:         8001 (warmup=50)
-Total Time:       30699.11 ms
-Total Tokens:     150673
-QPS:              260.63 req/s
-Token Throughput: 4908 tokens/s
+Total Time:       101048.14 ms
+Total Tokens:     11995045
+QPS:              79.18 req/s
+Token Throughput: 118706 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=26.840  p50=26.821  p90=27.864  p99=28.925  max=30.619
-    Data Gen   avg=0.007   p50=0.006   p90=0.009   p99=0.068   max=0.190
-    H2D        avg=0.077   p50=0.067   p90=0.092   p99=0.217   max=0.487
-    Execute    avg=26.613  p50=26.595  p90=27.630  p99=28.659  max=30.269
-    D2H        avg=0.142   p50=0.140   p90=0.167   p99=0.212   max=1.023
+  E2E (full)   avg=88.334  p50=88.046  p90=91.674  p99=96.582  max=103.911
+    Data Gen   avg=0.281   p50=0.278   p90=0.306   p99=0.368   max=0.751
+    H2D        avg=0.106   p50=0.101   p90=0.127   p99=0.202   max=0.579
+    Execute    avg=87.806  p50=87.518  p90=91.116  p99=96.009  max=103.415
+    D2H        avg=0.139   p50=0.135   p90=0.167   p99=0.202   max=0.894
 
 Per-Thread E2E:
-  Thread 0: 1143 reqs, avg_e2e=26.851ms
-  Thread 1: 1143 reqs, avg_e2e=26.826ms
-  Thread 2: 1143 reqs, avg_e2e=26.853ms
-  Thread 3: 1143 reqs, avg_e2e=26.840ms
-  Thread 4: 1143 reqs, avg_e2e=26.820ms
-  Thread 5: 1143 reqs, avg_e2e=26.854ms
-  Thread 6: 1143 reqs, avg_e2e=26.839ms
+  Thread 0: 1143 reqs, avg_e2e=88.366ms
+  Thread 1: 1143 reqs, avg_e2e=88.333ms
+  Thread 2: 1143 reqs, avg_e2e=88.325ms
+  Thread 3: 1143 reqs, avg_e2e=88.393ms
+  Thread 4: 1143 reqs, avg_e2e=88.381ms
+  Thread 5: 1143 reqs, avg_e2e=88.329ms
+  Thread 6: 1143 reqs, avg_e2e=88.208ms
 ```
 
 ### 7.8 8 threads
 
 ```
 Requests:         8000 (warmup=50)
-Total Time:       30763.97 ms
-Total Tokens:     150606
-QPS:              260.04 req/s
-Token Throughput: 4896 tokens/s
+Total Time:       101174.04 ms
+Total Tokens:     11993785
+QPS:              79.07 req/s
+Token Throughput: 118546 tokens/s
 
 Latency Breakdown (ms):
-  E2E (full)   avg=30.749  p50=30.758  p90=31.718  p99=32.773  max=35.172
-    Data Gen   avg=0.008   p50=0.006   p90=0.009   p99=0.058   max=0.556
-    H2D        avg=0.077   p50=0.066   p90=0.093   p99=0.239   max=0.666
-    Execute    avg=30.521  p50=30.532  p90=31.484  p99=32.552  max=34.961
-    D2H        avg=0.142   p50=0.141   p90=0.167   p99=0.207   max=1.244
+  E2E (full)   avg=101.115  p50=100.904  p90=103.904  p99=108.398  max=117.111
+    Data Gen   avg=0.281    p50=0.278    p90=0.305    p99=0.377    max=0.813
+    H2D        avg=0.108    p50=0.102    p90=0.130    p99=0.220    max=0.508
+    Execute    avg=100.584  p50=100.373  p90=103.352  p99=107.877  max=116.605
+    D2H        avg=0.140    p50=0.135    p90=0.170    p99=0.209    max=0.889
 
 Per-Thread E2E:
-  Thread 0: 1000 reqs, avg_e2e=30.734ms
-  Thread 1: 1000 reqs, avg_e2e=30.747ms
-  Thread 2: 1000 reqs, avg_e2e=30.759ms
-  Thread 3: 1000 reqs, avg_e2e=30.755ms
-  Thread 4: 1000 reqs, avg_e2e=30.758ms
-  Thread 5: 1000 reqs, avg_e2e=30.751ms
-  Thread 6: 1000 reqs, avg_e2e=30.742ms
-  Thread 7: 1000 reqs, avg_e2e=30.749ms
+  Thread 0: 1000 reqs, avg_e2e=101.131ms
+  Thread 1: 1000 reqs, avg_e2e=101.079ms
+  Thread 2: 1000 reqs, avg_e2e=101.020ms
+  Thread 3: 1000 reqs, avg_e2e=101.154ms
+  Thread 4: 1000 reqs, avg_e2e=101.158ms
+  Thread 5: 1000 reqs, avg_e2e=101.117ms
+  Thread 6: 1000 reqs, avg_e2e=101.103ms
+  Thread 7: 1000 reqs, avg_e2e=101.156ms
 ```
 
 ## 8. 附录 B: 测试环境详情
@@ -470,13 +481,13 @@ Per-Thread E2E:
 
 - SoC: Ascend910_9382
 - CANN: 9.0.0
-- Device: NPU 2
+- Device: NPU 14
 - HBM: 65536 MB
 
 ### 8.3 测试工具
 
 - 二进制: `atb/build/bench_latency`
 - 源码: `atb/bench_latency.cpp`
-- 模型: Producer-Consumer (无队列), N 个独立线程各自循环
+- 模型: 独立线程 (无队列), N 个独立线程各自循环
 - 每线程独立模型实例 (避免动态 shape 并发冲突)
 - 延迟拆分: Data Gen / H2D / Execute / D2H

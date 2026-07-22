@@ -18,6 +18,71 @@
 #include <map>
 
 #include "acl/acl.h"
+#include <fstream>
+#include <sys/stat.h>
+
+// ============================================================================
+// Profiling config
+// ============================================================================
+
+struct ProfilingConfig {
+    bool enabled = false;
+    std::string outputPath;
+    bool outputPathExplicit = false;
+    bool taskTime = true;
+    bool runtimeApi = true;
+    bool ascendcl = true;
+};
+
+static bool GenerateAclJson(const ProfilingConfig& profCfg, const std::string& outputPath)
+{
+    std::ofstream file(outputPath);
+    if (!file.is_open()) {
+        std::cerr << "[ERROR] Failed to create acl.json at: " << outputPath << std::endl;
+        return false;
+    }
+    file << "{\n";
+    file << "    \"profiler\": {\n";
+    file << "        \"switch\": \"on\",\n";
+    file << "        \"output\": \"" << profCfg.outputPath << "\",\n";
+    file << "        \"task_time\": \"" << (profCfg.taskTime ? "on" : "off") << "\",\n";
+    file << "        \"runtime_api\": \"" << (profCfg.runtimeApi ? "on" : "off") << "\",\n";
+    file << "        \"ascendcl\": \"" << (profCfg.ascendcl ? "on" : "off") << "\"\n";
+    file << "    }\n";
+    file << "}\n";
+    file.close();
+    return true;
+}
+
+static ProfilingConfig ParseProfilingConfig(int argc, char* argv[])
+{
+    ProfilingConfig cfg;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--profiling") {
+            cfg.enabled = true;
+        } else if (arg == "--profiling_output" && i + 1 < argc) {
+            cfg.outputPath = argv[++i];
+            cfg.outputPathExplicit = true;
+            cfg.enabled = true;
+        } else if (arg == "--profiling_no_task_time") {
+            cfg.taskTime = false;
+        } else if (arg == "--profiling_no_runtime_api") {
+            cfg.runtimeApi = false;
+        } else if (arg == "--profiling_no_ascendcl") {
+            cfg.ascendcl = false;
+        }
+    }
+    const char* envEnabled = getenv("PROFILING_ENABLED");
+    if (envEnabled && std::string(envEnabled) == "1") {
+        cfg.enabled = true;
+    }
+    const char* envOutput = getenv("PROFILING_OUTPUT");
+    if (envOutput) {
+        cfg.outputPath = envOutput;
+    }
+    return cfg;
+}
 
 // ============================================================================
 // Constants
@@ -678,10 +743,16 @@ static void print_usage(const char* prog) {
               << "  --requests <N>       Total requests across all threads (default: 10000)\n"
               << "  --device-id <id>     NPU device ID (default: 0)\n"
               << "  --warmup <N>         Warmup requests (default: 50)\n"
+              << "  --profiling          Enable CANN profiling (generates acl.json)\n"
+              << "  --profiling_output <dir>  Profiling output directory (default: ./profiling_data)\n"
+              << "  --profiling_no_task_time    Disable task_time collection\n"
+              << "  --profiling_no_runtime_api  Disable runtime_api collection\n"
+              << "  --profiling_no_ascendcl     Disable ascendcl collection\n"
               << "  -h, --help           Show this help\n"
               << "\nExamples:\n"
               << "  " << prog << " --model model.om --threads 4 --requests 10000 --device-id 2\n"
               << "  " << prog << " --model model.om --sweep 1,2,4,8,16 --requests 10000 --device-id 2\n"
+              << "  " << prog << " --model model.om --threads 6 --requests 100 --warmup 10 --profiling --device-id 0\n"
               << std::endl;
 }
 
@@ -707,6 +778,14 @@ int main(int argc, char* argv[]) {
             device_id = std::stoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::stoi(argv[++i]);
+        } else if (arg == "--profiling") {
+            // handled by ParseProfilingConfig
+        } else if (arg == "--profiling_output" && i + 1 < argc) {
+            i++;
+        } else if (arg == "--profiling_no_task_time" ||
+                   arg == "--profiling_no_runtime_api" ||
+                   arg == "--profiling_no_ascendcl") {
+            // handled by ParseProfilingConfig
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -734,8 +813,42 @@ int main(int argc, char* argv[]) {
         thread_counts.push_back(num_threads);
     }
 
+    // Parse profiling config
+    ProfilingConfig profCfg = ParseProfilingConfig(argc, argv);
+    const char* initConfigPath = nullptr;
+    std::string aclConfigPath;
+    if (profCfg.enabled) {
+        if (!profCfg.outputPathExplicit) {
+            std::string model_dir = model_path;
+            size_t slash1 = model_dir.find_last_of('/');
+            if (slash1 != std::string::npos) {
+                size_t slash2 = model_dir.find_last_of('/', slash1 - 1);
+                if (slash2 != std::string::npos) {
+                    model_dir = model_path.substr(0, slash2);
+                } else {
+                    model_dir = ".";
+                }
+            } else {
+                model_dir = ".";
+            }
+            profCfg.outputPath = model_dir + "/profiling_data";
+        }
+        mkdir(profCfg.outputPath.c_str(), 0755);
+        aclConfigPath = profCfg.outputPath + "/acl.json";
+        if (!GenerateAclJson(profCfg, aclConfigPath)) {
+            std::cerr << "[ERROR] Failed to generate acl.json" << std::endl;
+            return 1;
+        }
+        initConfigPath = aclConfigPath.c_str();
+        std::cout << "[INFO] Profiling enabled, acl.json: " << aclConfigPath << std::endl;
+        std::cout << "[INFO]   output=" << profCfg.outputPath << std::endl;
+        std::cout << "[INFO]   task_time=" << (profCfg.taskTime ? "on" : "off")
+                  << ", runtime_api=" << (profCfg.runtimeApi ? "on" : "off")
+                  << ", ascendcl=" << (profCfg.ascendcl ? "on" : "off") << std::endl;
+    }
+
     // Init ACL
-    aclError ret = aclInit(nullptr);
+    aclError ret = aclInit(initConfigPath);
     ACL_CHECK(ret, "aclInit");
     ret = aclrtSetDevice(device_id);
     ACL_CHECK(ret, "set_device");
