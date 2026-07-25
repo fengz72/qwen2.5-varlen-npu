@@ -5,15 +5,18 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
 threads   = [1, 2, 3, 4, 5, 6, 7, 8]
-qps       = [67.30, 79.31, 79.73, 80.01, 80.00, 79.46, 79.18, 79.07]
-e2e_avg   = [14.86, 25.21, 37.60, 49.96, 62.47, 75.46, 88.33, 101.11]
-e2e_p99   = [16.17, 27.09, 40.88, 54.52, 68.79, 83.33, 96.58, 108.40]
+qps       = [78.70, 91.02, 95.75, 98.53, 99.67, 99.54, 99.18, 98.67]
+tps       = [117995, 136414, 143508, 147623, 149325, 149237, 148685, 147921]
+e2e_avg   = [12.70, 21.94, 31.32, 40.57, 50.13, 60.24, 70.54, 81.05]
+e2e_p99   = [14.30, 26.92, 34.65, 44.99, 54.67, 64.84, 75.07, 85.25]
 
 fig, ax1 = plt.subplots(figsize=(10, 6))
 
 color_qps = '#2196F3'
+color_tps = '#4CAF50'
 color_avg = '#F44336'
 color_p99 = '#FF9800'
 
@@ -37,14 +40,16 @@ ax1.legend(lines, labels, loc='center right', fontsize=11)
 
 ax1.grid(True, alpha=0.3, linestyle='--')
 
-ax1.axvline(x=2, color='gray', alpha=0.5, linestyle='-.', linewidth=1)
-ax1.annotate('Saturation\npoint', xy=(2, max(qps)*1.15), fontsize=9,
+ax1.axvline(x=5, color='gray', alpha=0.5, linestyle='-.', linewidth=1)
+ax1.annotate('Optimal\n(5 threads)', xy=(5, max(qps)*1.15), fontsize=9,
              color='gray', ha='center')
 
-plt.title('Qwen2.5-0.5B: QPS & Latency vs Threads (Independent Threads)',
-          fontsize=14, pad=12)
+plt.title('Qwen2.5-0.5B: QPS & Latency vs Threads (batch=10, seq~150, Ascend910_9382)',
+          fontsize=13, pad=12)
 plt.tight_layout()
 
-out = '/export/home/weinan5/hejun/workspace/qwen2.5/atb/models/qwen2.5-0.5b/docs/latency_qps_curve.png'
+out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   'models', 'qwen2.5-0.5b', 'docs', 'latency_qps_curve.png')
+os.makedirs(os.path.dirname(out), exist_ok=True)
 plt.savefig(out, dpi=150, bbox_inches='tight')
 print(f'Saved: {out}')

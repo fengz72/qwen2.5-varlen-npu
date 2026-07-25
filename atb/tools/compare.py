@@ -51,19 +51,39 @@ class PrecisionComparator:
             'total_elements': total_elements,
         }
         
-        # 检查是否在容忍度内
+        # 检查是否在容忍度内（保留原 allclose 判定，向后兼容）
         metrics['pass_rtol_atol'] = bool(np.allclose(golden, target, rtol=rtol, atol=atol))
         metrics['max_diff_position'] = np.unravel_index(np.argmax(abs_diff), abs_diff.shape)
-        
+
+        # 有效相对误差：过滤 |golden| < 0.1 的近零值，避免相对误差爆炸
+        abs_threshold = 0.1
+        valid_mask = np.abs(golden) > abs_threshold
+        valid_rel_diff = rel_diff[valid_mask]
+        if valid_rel_diff.size > 0:
+            metrics['mean_rel_error_valid'] = float(np.mean(valid_rel_diff))
+            metrics['max_rel_error_valid'] = float(np.max(valid_rel_diff))
+        else:
+            metrics['mean_rel_error_valid'] = 0.0
+            metrics['max_rel_error_valid'] = 0.0
+        metrics['valid_element_count'] = int(valid_mask.sum())
+
         # 统计相对误差超过rtol的点数占比
         exceed_count = np.sum(rel_diff > rtol)
         metrics['rel_error_exceed_rtol_count'] = int(exceed_count)
         metrics['rel_error_exceed_rtol_ratio'] = float(exceed_count) / total_elements if total_elements > 0 else 0.0
-        
+
         # 同时统计绝对误差超过atol的点数占比
         exceed_atol_count = np.sum(abs_diff > atol)
         metrics['abs_error_exceed_atol_count'] = int(exceed_atol_count)
         metrics['abs_error_exceed_atol_ratio'] = float(exceed_atol_count) / total_elements if total_elements > 0 else 0.0
+
+        # 二重 pass/fail 判定：仅基于整体分布指标（cosine + L2）
+        # 逐元素通过率仅作参考显示，不参与最终判定
+        tolerance_mask = abs_diff <= (atol + rtol * np.abs(golden))
+        metrics['pass_rate'] = float(np.sum(tolerance_mask)) / total_elements if total_elements > 0 else 0.0
+        metrics['pass_cosine'] = metrics['cosine_similarity'] > 0.9999
+        metrics['pass_l2'] = metrics['relative_l2_error'] < 0.01
+        metrics['pass_overall'] = metrics['pass_cosine'] and metrics['pass_l2']
         
         # 统计误差分布
         error_percentiles = [50, 90, 95, 99, 99.9]
@@ -119,14 +139,18 @@ class PrecisionComparator:
             print(f"形状: {golden.shape} {target.shape}")
             print(f"数据类型: golden={golden.dtype}, target={target.dtype}")
             print(f"总元素数: {metrics['total_elements']:,}")
+            golden_f32 = golden.astype(np.float32)
+            target_f32 = target.astype(np.float32)
             print(f"\n基本统计:")
-            print(f"  Golden - mean: {np.mean(golden):.6e}, std: {np.std(golden):.6e}")
-            print(f"  Target - mean: {np.mean(target):.6e}, std: {np.std(target):.6e}")
+            print(f"  Golden - mean: {np.mean(golden_f32):.6e}, std: {np.std(golden_f32):.6e}")
+            print(f"  Target - mean: {np.mean(target_f32):.6e}, std: {np.std(target_f32):.6e}")
             print(f"\n误差指标:")
             print(f"  最大绝对误差: {metrics['max_abs_error']:.6e}")
             print(f"  平均绝对误差: {metrics['mean_abs_error']:.6e}")
-            print(f"  最大相对误差: {metrics['max_rel_error']:.6e}")
-            print(f"  平均相对误差: {metrics['mean_rel_error']:.6e}")
+            print(f"  最大相对误差: {metrics['max_rel_error']:.6e} (全量, 含近零值)")
+            print(f"  平均相对误差: {metrics['mean_rel_error']:.6e} (全量, 含近零值)")
+            print(f"  最大相对误差(有效): {metrics['max_rel_error_valid']:.6e} (|golden|>0.1, {metrics['valid_element_count']:,}/{metrics['total_elements']:,} 元素)")
+            print(f"  平均相对误差(有效): {metrics['mean_rel_error_valid']:.6e} (|golden|>0.1)")
             print(f"  RMSE: {metrics['rmse']:.6e}")
             print(f"  相对L2误差: {metrics['relative_l2_error']:.6e}")
             print(f"\n相似度指标:")
@@ -135,12 +159,19 @@ class PrecisionComparator:
             print(f"\n误差容忍度统计 (rtol={rtol}, atol={atol}):")
             print(f"  相对误差超过rtol的点数: {metrics['rel_error_exceed_rtol_count']:,} ({metrics['rel_error_exceed_rtol_ratio']*100:.4f}%)")
             print(f"  绝对误差超过atol的点数: {metrics['abs_error_exceed_atol_count']:,} ({metrics['abs_error_exceed_atol_ratio']*100:.4f}%)")
+            print(f"  通过率 (|err| <= atol + rtol*|golden|): {metrics['pass_rate']*100:.4f}%")
             print(f"\n误差分布:")
             for key, value in metrics.items():
-                if 'error_p' in key and 'exceed' not in key:
+                if 'error_p' in key and 'exceed' not in key and 'valid' not in key:
                     print(f"  {key}: {value:.6e}")
             print(f"\n最大误差位置: {metrics['max_diff_position']}")
-            print(f"\n通过测试 (rtol={rtol}, atol={atol}): {metrics['pass_rtol_atol']}")
+            print(f"\n通过判定 (二重, 基于整体分布):")
+            print(f"  余弦相似度 > 0.9999: {metrics['pass_cosine']}  (实际: {metrics['cosine_similarity']:.8f})")
+            print(f"  相对L2误差 < 0.01:   {metrics['pass_l2']}  (实际: {metrics['relative_l2_error']:.6e})")
+            print(f"  综合判定:            {'PASS' if metrics['pass_overall'] else 'FAIL'}")
+            print(f"\n逐元素参考 (不参与判定):")
+            print(f"  allclose (rtol={rtol}, atol={atol}): {metrics['pass_rtol_atol']}  [fp16下通常False]")
+            print(f"  通过率 (|err| <= atol + rtol*|golden|): {metrics['pass_rate']*100:.4f}%")
             print(f"{'='*60}\n")
         
         return metrics

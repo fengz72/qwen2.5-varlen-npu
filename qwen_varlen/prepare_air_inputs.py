@@ -19,6 +19,7 @@ cos/sin 预计算策略:
 同时运行 eager 模式生成 golden logits 供精度对比。
 """
 
+import argparse
 import os
 import torch
 import torch_npu
@@ -31,7 +32,7 @@ from qwen_varlen.export_air import patch_attention_for_dynamic
 
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
 DEFAULT_OUTPUT_DIR = "atb/models/qwen2.5-0.5b/input_data"
-DEFAULT_DEVICE = 2
+DEFAULT_DEVICE = 0
 
 BATCH_SIZE = 10
 SEQ_LEN = 208
@@ -39,12 +40,18 @@ MAX_SEQ_LEN = 2048
 
 
 def main():
-    torch.npu.set_device(DEFAULT_DEVICE)
+    parser = argparse.ArgumentParser(description="生成 OM 输入数据 + golden logits")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="模型路径")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
+    parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
+    args = parser.parse_args()
+
+    torch.npu.set_device(args.device)
 
     # 1. 加载模型 (与 export 完全一致)
     register_npu_fia()
     model = AutoModelForCausalLM.from_pretrained(
-        DEFAULT_MODEL_PATH, dtype=torch.float16, attn_implementation="npu_fia"
+        args.model_path, dtype=torch.float16, attn_implementation="npu_fia"
     ).npu()
     model.eval()
     model.config.use_cache = False
@@ -98,13 +105,13 @@ def main():
     ]
 
     # 5. 保存
-    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     list_lines = []
     arg_names = ["arg1_1", "arg3_1", "arg5_1", "arg8_1"]
     for idx, (name, tensor) in enumerate(inputs):
         fname = f"{name}.bin"
-        fpath = os.path.join(DEFAULT_OUTPUT_DIR, fname)
+        fpath = os.path.join(args.output_dir, fname)
         tensor.detach().numpy().tofile(fpath)
 
         shape = ",".join(str(s) for s in tensor.shape)
@@ -120,14 +127,14 @@ def main():
         list_lines.append(f"{arg_names[idx]}:{shape}:{dtype}:ND:{fpath}")
         print(f"  [{idx}] {arg_names[idx]:12s} {name:25s} shape={str(tensor.shape):25s} dtype={dtype}")
 
-    list_path = os.path.join(DEFAULT_OUTPUT_DIR, "input_list.txt")
+    list_path = os.path.join(args.output_dir, "input_list.txt")
     with open(list_path, 'w') as f:
         for line in list_lines:
             f.write(line + "\n")
     print(f"\nInput list saved to: {list_path} ({len(inputs)} inputs)")
 
     # 6. 保存 golden logits
-    golden_path = os.path.join(DEFAULT_OUTPUT_DIR, "golden_logits.bin")
+    golden_path = os.path.join(args.output_dir, "golden_logits.bin")
     golden_logits.detach().numpy().tofile(golden_path)
     print(f"Golden logits saved to: {golden_path}")
 
