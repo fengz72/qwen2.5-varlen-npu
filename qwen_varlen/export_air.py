@@ -146,6 +146,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
         dynamic:     是否导出动态 shape
     """
     torch.npu.set_device(device)
+    # torch.npu.config.allow_internal_format = True
     logging.getLogger('torchair').setLevel(logging.INFO)
 
     # 1. 加载模型 (NPU, npu_fia, fp16)
@@ -163,6 +164,22 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
 
     # 2.1 patch attention forward, 用 -1 替代 q_len 避免 Pack
     patch_attention_for_dynamic()
+
+    # # 2.2 lm_head.weight 预转 FRACTAL_NZ + register_buffer 固定为常量
+    # with torch.no_grad():
+    #     if getattr(model.config, 'tie_word_embeddings', False):
+    #         weight_data = model.model.embed_tokens.weight.data.clone()
+    #         print("[nz] 解除 lm_head/embed_tokens weight tying (clone)")
+    #     else:
+    #         weight_data = model.lm_head.weight.data.clone()
+    #     del model.lm_head.weight
+    #     model.lm_head.register_buffer('weight', weight_data)
+    #     model.lm_head.weight = torch_npu.npu_format_cast(
+    #         model.lm_head.weight, torch_npu.Format.FRACTAL_NZ
+    #     )
+    #     print(f"[nz] lm_head.weight → register_buffer + FRACTAL_NZ "
+    #           f"(format={torch_npu.get_npu_format(model.lm_head.weight)}, "
+    #           f"type={type(model.lm_head.weight).__name__})")
 
     # 3. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
     concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
@@ -277,11 +294,14 @@ def verify_air(air_dir):
     print()
 
 
-def run_atc(air_path, om_dir, soc, input_shape=None):
+def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
     """执行 ATC 命令将 AIR 编译为 OM。
 
     --framework=1 表示输入为 AIR 格式 (GE 原生图格式)。
     OM 输出到 om_dir 目录, 文件名与 AIR 相同。
+    使用自定义 Pass (NzWeightPass) 在 Const→MatMul 间插入 TransData,
+    利用常量折叠在编译期完成大权重 ND→FRACTAL_NZ 转换, 消除运行时 TransData。
+    NzWeightPass 已安装到 CANN opp/vendors/custom_nz_pass/custom_fusion_passes/。
     """
     os.makedirs(om_dir, exist_ok=True)
     air_basename = os.path.splitext(os.path.basename(air_path))[0]
@@ -295,6 +315,9 @@ def run_atc(air_path, om_dir, soc, input_shape=None):
     )
     if input_shape:
         cmd += f' --input_shape="{input_shape}"'
+
+    if is_debug:
+        cmd += f' --log=debug'
 
     print(f"=== 执行 ATC 编译 ===")
     print(f"  命令: {cmd}\n")
@@ -335,27 +358,31 @@ def main():
     parser.add_argument("--dynamic", action="store_true", help="导出动态 shape")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
     parser.add_argument("--run-atc", action="store_true", default=False, help="自动执行 ATC 编译")
+    parser.add_argument("--debug", action="store_true", default=False, help="开启 debug 模式")
     parser.add_argument("--verify", action="store_true", default=True, help="验证导出的算子")
     args = parser.parse_args()
 
-    # 1. 导出 AIR
-    air_path = export_air(
-        args.model_path,
-        args.output_dir,
-        args.device,
-        args.batch_size,
-        args.seq_len,
-        dynamic=args.dynamic,
-        export_name=args.model_name,
-    )
-
-    # 2. 验证算子
-    if args.verify:
-        verify_air(args.output_dir)
+    
+    if args.debug:
+        air_path = "/export/home/weinan5/hejun/workspace/qwen2.5/atb/models/qwen2.5-0.5b/air/qwen2.5-0.5b.air"
+    else :
+        # 1. 导出 AIR
+        air_path = export_air(
+                    args.model_path,
+                    args.output_dir,
+                    args.device,
+                    args.batch_size,
+                    args.seq_len,
+                    dynamic=args.dynamic,
+                    export_name=args.model_name,
+                )
+        # 2. 验证算子
+        if args.verify:
+            verify_air(args.output_dir)
 
     # 3. ATC 编译
     if args.run_atc:
-        om_path = run_atc(air_path, args.om_dir, args.soc)
+        om_path = run_atc(air_path, args.om_dir, args.soc, is_debug=args.debug)
         if om_path:
             print(f"=== 全流程完成 ===")
             print(f"  AIR: {air_path}")

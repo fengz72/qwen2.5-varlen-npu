@@ -15,6 +15,7 @@ ge_check_op.json
 prof_output/
 prof_*/
 log/
+*.log
 
 # ===== 模型编译产物与数据（体积大，可重新生成）=====
 atb/models/*/air/

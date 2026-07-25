@@ -11,6 +11,9 @@
       拆分为独立 MatMul 后可达 85%, 整体 MLP 提速 16.4%。
       详见 docs/ffn_fusion_optimization.md
 
+注意: QKV 不做融合。测试表明融合后 StridedSliceV3 开销 (1152us/iter)
+      远超 MatMul 节省 (243us/iter), 整体慢 8.6%。
+
 用法:
     from qwen_varlen.fusion_ops import apply_fusion_ops
     apply_fusion_ops(model)  # 在模型加载后、编译前调用
