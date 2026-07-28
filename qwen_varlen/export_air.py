@@ -5,8 +5,8 @@
 直接保留 NPU 融合算子 (FusedInferAttentionScore, FFN, RmsNorm, RotaryMul)。
 
 用法:
-    python -m qwen_varlen.export_air --device 0 --dynamic --verify
-    python -m qwen_varlen.export_air --device 0 --dynamic --run-atc --soc Ascend910_9382
+    python -m qwen_varlen.export_air --device 0
+    python -m qwen_varlen.export_air --device 0 --run-atc --soc Ascend910_9382
 """
 
 import os
@@ -127,7 +127,7 @@ class ExportWrapper(nn.Module):
         return self.model.lm_head(last_hidden)
 
 
-def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=False, export_name="qwen2.5-0.5b"):
+def export_air(model_path, output_dir, device, batch_size, seq_len, export_name="qwen2.5-0.5b"):
     """导出 AIR 模型。
 
     流程:
@@ -135,7 +135,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
       2. 应用融合算子 (RMSNorm + RoPE)
       3. 设置 varlen 参数 (actual_seq_lengths, atten_mask, cos/sin 预计算)
       4. 包装模型 (ExportWrapper, 只返回 logits)
-      5. dynamo_export 导出 AIR
+      5. dynamo_export 导出 AIR (动态 shape)
 
     Args:
         model_path:  模型路径
@@ -143,7 +143,6 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
         device:      NPU 设备号
         batch_size:  batch size
         seq_len:     每条文本近似 token 数
-        dynamic:     是否导出动态 shape
     """
     torch.npu.set_device(device)
     # torch.npu.config.allow_internal_format = True
@@ -199,31 +198,27 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
 
     # 4.1 精确标记动态/静态维度
     #    T (total tokens) 动态, N (序列数) 固定, D (head_dim) 固定
-    if dynamic:
-        torch._dynamo.mark_dynamic(input_ids, 0)            # [T] → T 动态
-        torch._dynamo.mark_dynamic(position_ids, 0)         # [T] → T 动态
-        torch._dynamo.mark_dynamic(actual_seq_lengths, 0)   # [N] → N 动态 (batch size 可变)
-        torch._dynamo.mark_dynamic(cos, 1)                  # [1, T, 64] → T 动态
-        torch._dynamo.mark_dynamic(sin, 1)                  # [1, T, 64] → T 动态
-        torch._dynamo.mark_static(cos, 0)                   # [1, T, 64] → B=1 固定
-        torch._dynamo.mark_static(cos, 2)                   # [1, T, 64] → D=64 固定
-        torch._dynamo.mark_static(sin, 0)                   # [1, T, 64] → B=1 固定
-        torch._dynamo.mark_static(sin, 2)                   # [1, T, 64] → D=64 固定
+    torch._dynamo.mark_dynamic(input_ids, 0)            # [T] → T 动态
+    torch._dynamo.mark_dynamic(position_ids, 0)         # [T] → T 动态
+    torch._dynamo.mark_dynamic(actual_seq_lengths, 0)   # [N] → N 动态 (batch size 可变)
+    torch._dynamo.mark_dynamic(cos, 1)                  # [1, T, 64] → T 动态
+    torch._dynamo.mark_dynamic(sin, 1)                  # [1, T, 64] → T 动态
+    torch._dynamo.mark_static(cos, 0)                   # [1, T, 64] → B=1 固定
+    torch._dynamo.mark_static(cos, 2)                   # [1, T, 64] → D=64 固定
+    torch._dynamo.mark_static(sin, 0)                   # [1, T, 64] → B=1 固定
+    torch._dynamo.mark_static(sin, 2)                   # [1, T, 64] → D=64 固定
 
     # 5. 包装模型
     export_model = ExportWrapper(model)
 
-    # 6. 配置 CompilerConfig
+    # 6. 配置 CompilerConfig (frozen_parameter 配合动态导出)
     config = CompilerConfig()
-    if dynamic:
-        config.experimental_config.frozen_parameter = 1
+    config.experimental_config.frozen_parameter = 1
 
     # 7. 导出 AIR
     os.makedirs(output_dir, exist_ok=True)
-    export_name = export_name
 
-    print(f"=== 导出 AIR: {output_dir}/{export_name}.air ===")
-    print(f"  dynamic={dynamic}")
+    print(f"=== 导出 AIR (动态): {output_dir}/{export_name}.air ===")
     print(f"  input_ids: {input_ids.shape}, position_ids: {position_ids.shape}")
     print(f"  actual_seq_lengths: {actual_seq_lengths.shape}")
     print(f"  cos: {cos.shape}, sin: {sin.shape}")
@@ -233,7 +228,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
         model=export_model,
         export_path=output_dir,
         export_name=export_name,
-        dynamic=dynamic,
+        dynamic=True,
         config=config,
     )
 
@@ -252,46 +247,6 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, dynamic=Fals
         print("  请检查上方日志中的 'export error!' 信息\n")
 
     return air_path
-
-
-def verify_air(air_dir):
-    """检查导出的 dynamo.pbtxt 中的算子列表。"""
-    pbtxt_path = os.path.join(air_dir, "dynamo.pbtxt")
-    if not os.path.exists(pbtxt_path):
-        print(f"[WARN] dynamo.pbtxt 不存在: {pbtxt_path}")
-        return
-
-    import re
-    from collections import Counter
-
-    with open(pbtxt_path, 'r') as f:
-        content = f.read()
-
-    op_counts = Counter(re.findall(r'op: "([^"]+)"', content))
-
-    ops_to_check = [
-        ("FusedInferAttentionScore", 24, "推理 Attention 融合算子"),
-        ("FFN", 0, "MLP 融合算子 (不应出现, 使用小算子)"),
-        ("RmsNorm", 49, "RMSNorm 融合算子 (24层×2 + 1 final)"),
-        ("ApplyRotaryPosEmb", 24, "RoPE 融合算子 (24层, Q+K 一次调用)"),
-        ("MatMulV2", 72, "Q/K/V projection (24层×3)"),
-        ("MatMul", 97, "gate+up+down+O_proj+lm_head (24×3+24+1)"),
-        ("Mul", 24, "SwiGLU: silu(gate)*up (24层)"),
-        ("Swish", 24, "SwiGLU activation (24层)"),
-    ]
-
-    print("=== AIR 算子验证 ===")
-    for op_name, expected, desc in ops_to_check:
-        count = op_counts.get(op_name, 0)
-        status = "OK" if count == expected else ("WARN" if count > 0 else "MISSING")
-        print(f"  {op_name:35s} {count:4d} (expected {expected:3d})  [{status}]  ({desc})")
-
-    print(f"\n  总算子节点数: {sum(op_counts.values())}")
-    print(f"  算子类型数: {len(op_counts)}")
-    print(f"\n  全部算子分布:")
-    for op, cnt in op_counts.most_common():
-        print(f"    {op:35s} {cnt}")
-    print()
 
 
 def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
@@ -355,32 +310,29 @@ def main():
     parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
     parser.add_argument("--batch-size", type=int, default=10, help="batch size")
     parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数")
-    parser.add_argument("--dynamic", action="store_true", help="导出动态 shape")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
-    parser.add_argument("--run-atc", action="store_true", default=False, help="自动执行 ATC 编译")
-    parser.add_argument("--debug", action="store_true", default=False, help="开启 debug 模式")
-    parser.add_argument("--verify", action="store_true", default=True, help="验证导出的算子")
+    parser.add_argument("--run-atc", action="store_true", help="自动执行 ATC 编译")
+    parser.add_argument("--skip-export", action="store_true",
+                        help="跳过导出, 直接用已有 AIR 做 ATC 编译")
+    parser.add_argument("--debug", action="store_true", help="ATC 编译时开启 --log=debug")
     args = parser.parse_args()
 
-    
-    if args.debug:
-        air_path = "/export/home/weinan5/hejun/workspace/qwen2.5/atb/models/qwen2.5-0.5b/air/qwen2.5-0.5b.air"
-    else :
-        # 1. 导出 AIR
+    air_path = os.path.join(args.output_dir, f"{args.model_name}.air")
+    if args.skip_export:
+        if not os.path.exists(air_path):
+            print(f"[ERROR] AIR 文件不存在: {air_path}, 请先去掉 --skip-export 导出")
+            return
+        print(f"=== 跳过导出, 使用已有 AIR: {air_path} ===")
+    else:
         air_path = export_air(
-                    args.model_path,
-                    args.output_dir,
-                    args.device,
-                    args.batch_size,
-                    args.seq_len,
-                    dynamic=args.dynamic,
-                    export_name=args.model_name,
-                )
-        # 2. 验证算子
-        if args.verify:
-            verify_air(args.output_dir)
+            args.model_path,
+            args.output_dir,
+            args.device,
+            args.batch_size,
+            args.seq_len,
+            export_name=args.model_name,
+        )
 
-    # 3. ATC 编译
     if args.run_atc:
         om_path = run_atc(air_path, args.om_dir, args.soc, is_debug=args.debug)
         if om_path:
