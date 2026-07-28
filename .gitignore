@@ -24,6 +24,7 @@ atb/models/*/input_data/
 atb/models/*/output/
 atb/models/*/profiling_data/
 atb/models/*/profiling_data*
+**/*.so
 
 # ===== 会话日志 =====
 session-ses_*.md

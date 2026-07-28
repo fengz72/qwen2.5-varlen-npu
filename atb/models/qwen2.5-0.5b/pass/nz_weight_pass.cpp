@@ -1,8 +1,13 @@
 #include "register/register_custom_pass.h"
 #include "graph/graph.h"
-#include "transformation_ops.h" 
+#include "graph/tensor.h"
+#include "graph/types.h"
+#include "graph/ascend_string.h"
+#include "ops_proto_nn.h"
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <vector>
 
 using namespace ge;
 
@@ -51,27 +56,138 @@ static Status MatMulWeightNZPass(GraphPtr &graph, CustomPassContext &ctx) {
             std::cout << "the weight inner axis is less 65536" << std::endl;
             continue;
         }
-        // add transdata
-        std::string transdata_name = std::string(node_name.GetString()) + "_transdata";
-        op::TransData transdata_op(transdata_name.c_str());
-        // set attr
-        transdata_op.SetAttr("src_format", "ND");
-        transdata_op.SetAttr("dst_format", "FRACTAL_NZ");
-        // set input desc
-        transdata_op.UpdateInputDesc("src", weight_desc);
-        // set output desc
-        weight_desc.SetFormat(FORMAT_FRACTAL_NZ);
-        Shape shape_nz({(n_dim+15)/16, (k_dim+15)/16, 16, 16});
-        weight_desc.SetShape(shape_nz);
-        transdata_op.UpdateOutputDesc("dst", weight_desc);
-        // update the weight des of mm
-        node.UpdateInputDesc(1, weight_desc);
-        auto transdata_node = graph->AddNodeByOp(transdata_op);
-        // remove adge
+        // read const tensor data
+        Tensor const_tensor;
+        if (weight_node->GetAttr(AscendString("value"), const_tensor) != GRAPH_SUCCESS) {
+            std::cout << "failed to read const value" << std::endl;
+            continue;
+        }
+        DataType dt = const_tensor.GetTensorDesc().GetDataType();
+        int64_t elem_size = GetSizeByDataType(dt);
+        if (elem_size <= 0) {
+            std::cout << "unsupported dtype" << std::endl;
+            continue;
+        }
+        const uint8_t *src = const_tensor.GetData();
+        if (src == nullptr) {
+            std::cout << "const data is null" << std::endl;
+            continue;
+        }
+        // rearrange ND [K,N] -> FRACTAL_NZ [N1,K1,16,16]
+        int64_t K1 = (k_dim + 15) / 16;
+        int64_t N1 = (n_dim + 15) / 16;
+        size_t nz_size = static_cast<size_t>(N1 * K1 * 16 * 16) * static_cast<size_t>(elem_size);
+        std::vector<uint8_t> nz_data(nz_size, 0);
+        for (int64_t n1 = 0; n1 < N1; n1++) {
+            for (int64_t k1 = 0; k1 < K1; k1++) {
+                for (int64_t r = 0; r < 16; r++) {
+                    int64_t sk = k1 * 16 + r;
+                    if (sk >= k_dim) break;
+                    for (int64_t c = 0; c < 16; c++) {
+                        int64_t sn = n1 * 16 + c;
+                        if (sn >= n_dim) break;
+                        size_t src_off = static_cast<size_t>(sk * n_dim + sn) * static_cast<size_t>(elem_size);
+                        size_t dst_off = static_cast<size_t>(((n1 * K1 + k1) * 16 + r) * 16 + c) * static_cast<size_t>(elem_size);
+                        std::memcpy(&nz_data[dst_off], src + src_off, static_cast<size_t>(elem_size));
+                    }
+                }
+            }
+        }
+        // build nz tensor desc, keep origin shape/format for logical [K,N]
+        Shape nz_shape({N1, K1, 16, 16});
+        TensorDesc nz_desc(nz_shape, FORMAT_FRACTAL_NZ, dt);
+        nz_desc.SetOriginShape(weight_shape);
+        nz_desc.SetOriginFormat(FORMAT_ND);
+        nz_desc.SetRealDimCnt(4);
+        nz_desc.SetSize(nz_size);
+        nz_desc.SetPlacement(kPlacementDevice);
+        // write back const value and update output desc
+        Tensor new_tensor(nz_desc);
+        new_tensor.SetData(nz_data.data(), nz_size);
+        weight_node->SetAttr(AscendString("value"), new_tensor);
+        weight_node->UpdateOutputDesc(0, nz_desc);
+        // create MatMulV3 to replace MatMulV2 (MatMulV3 natively supports NZ weight)
+        bool transpose_x1 = false, transpose_x2 = false;
+        int64_t offset_x = 0;
+        node.GetAttr(AscendString("transpose_x1"), transpose_x1);
+        node.GetAttr(AscendString("transpose_x2"), transpose_x2);
+        node.GetAttr(AscendString("offset_x"), offset_x);
+        // collect all input nodes before rewiring
+        auto [x1_node, x1_idx] = node.GetInDataNodesAndPortIndexs(0);
+        GNodePtr bias_node = nullptr;
+        int32_t bias_idx = 0;
+        auto [bias_in, bias_in_idx] = node.GetInDataNodesAndPortIndexs(2);
+        if (bias_in) { bias_node = bias_in; bias_idx = bias_in_idx; }
+        GNodePtr ow_node = nullptr;
+        int32_t ow_idx = 0;
+        auto [ow_in, ow_in_idx] = node.GetInDataNodesAndPortIndexs(3);
+        if (ow_in) { ow_node = ow_in; ow_idx = ow_in_idx; }
+        // collect output consumers
+        auto out_consumers = node.GetOutDataNodesAndPortIndexs(0);
+        // create MatMulV3 operator (natively supports NZ weight)
+        std::string v3_name = std::string(node_name.GetString()) + "_v3";
+        op::MatMulV3 mm_v3_op(v3_name.c_str());
+        mm_v3_op.set_attr_transpose_x1(transpose_x1);
+        mm_v3_op.set_attr_transpose_x2(transpose_x2);
+        mm_v3_op.set_attr_offset_x(offset_x);
+        mm_v3_op.set_attr_opImplMode((int64_t)1);
+        // set input/output descs on operator before adding to graph
+        TensorDesc x1_desc;
+        node.GetInputDesc(0, x1_desc);
+        std::vector<std::pair<int64_t, int64_t>> x1_range;
+        x1_desc.GetShapeRange(x1_range);
+        mm_v3_op.update_input_desc_x1(x1_desc);
+        // build x2 nz desc with full metadata
+        TensorDesc x2_nz_desc(nz_shape, FORMAT_FRACTAL_NZ, dt);
+        x2_nz_desc.SetOriginShape(weight_shape);
+        x2_nz_desc.SetOriginFormat(FORMAT_ND);
+        x2_nz_desc.SetRealDimCnt(4);
+        x2_nz_desc.SetSize(nz_size);
+        x2_nz_desc.SetPlacement(kPlacementDevice);
+        mm_v3_op.update_input_desc_x2(x2_nz_desc);
+        TensorDesc y_desc;
+        node.GetOutputDesc(0, y_desc);
+        std::vector<std::pair<int64_t, int64_t>> y_range;
+        y_desc.GetShapeRange(y_range);
+        mm_v3_op.update_output_desc_y(y_desc);
+        if (bias_node) {
+            TensorDesc bias_desc;
+            node.GetInputDesc(2, bias_desc);
+            mm_v3_op.update_input_desc_bias(bias_desc);
+        }
+        if (ow_node) {
+            TensorDesc ow_desc;
+            node.GetInputDesc(3, ow_desc);
+            mm_v3_op.update_input_desc_offset_w(ow_desc);
+        }
+        auto mm_v3_node = graph->AddNodeByOp(mm_v3_op);
+        //补上 GE 内部 desc 属性，旧节点由 GE 优化 pass 自动设置，新节点需手动补
+        int64_t fmt_nd = 2;
+        int64_t fmt_nz = 29;
+        mm_v3_node.SetAttr(AscendString("input_desc_attr_format_for_int:0"), fmt_nd);
+        mm_v3_node.SetAttr(AscendString("input_desc_attr_format_for_int:1"), fmt_nz);
+        mm_v3_node.SetAttr(AscendString("input_desc_attr_origin_format_for_int:0"), fmt_nd);
+        mm_v3_node.SetAttr(AscendString("input_desc_attr_origin_format_for_int:1"), fmt_nd);
+        mm_v3_node.SetAttr(AscendString("output_desc_attr_format_for_int:0"), fmt_nd);
+        mm_v3_node.SetAttr(AscendString("output_desc_attr_origin_format_for_int:0"), fmt_nd);
+        // remove old edges
+        graph->RemoveEdge(*x1_node, x1_idx, node, 0);
         graph->RemoveEdge(*weight_node, weight_index, node, 1);
-        // add adge
-        graph->AddDataEdge(*weight_node, weight_index, transdata_node, 0);
-        graph->AddDataEdge(transdata_node, 0, node, 1);
+        if (bias_node) { graph->RemoveEdge(*bias_node, bias_idx, node, 2); }
+        if (ow_node) { graph->RemoveEdge(*ow_node, ow_idx, node, 3); }
+        for (auto &consumer : out_consumers) {
+            graph->RemoveEdge(node, 0, *consumer.first, consumer.second);
+        }
+        // add new edges
+        graph->AddDataEdge(*x1_node, x1_idx, mm_v3_node, 0);
+        graph->AddDataEdge(*weight_node, weight_index, mm_v3_node, 1);
+        if (bias_node) { graph->AddDataEdge(*bias_node, bias_idx, mm_v3_node, 2); }
+        if (ow_node) { graph->AddDataEdge(*ow_node, ow_idx, mm_v3_node, 3); }
+        for (auto &consumer : out_consumers) {
+            graph->AddDataEdge(mm_v3_node, 0, *consumer.first, consumer.second);
+        }
+        // remove old MatMulV2 node
+        graph->RemoveNode(node);
         matmul_effect++;
     }
     std::cout << "the matmul_match num is  " << matmul_match << std::endl;
@@ -80,89 +196,6 @@ static Status MatMulWeightNZPass(GraphPtr &graph, CustomPassContext &ctx) {
 }
 }
 
-// static Status NzWeightPass(GraphPtr &graph, CustomPassContext &ctx) {
-//     auto nodes = graph->GetAllNodes();
-//     int inserted = 0;
-//     for (auto &node : nodes) {
-//         AscendString type;
-//         node.GetType(type);
-//         std::string op_type(type.GetString());
-//         if (op_type != "MatMul" && op_type != "MatMulV2") {
-//             continue;
-//         }
-
-//         for (int32_t i = 0; i < 2; i++) {
-//             auto input_pair = node.GetInDataNodesAndPortIndexs(i);
-//             if (!input_pair.first) continue;
-
-//             AscendString in_type;
-//             input_pair.first->GetType(in_type);
-//             if (std::string(in_type.GetString()) != "Const") continue;
-
-//             TensorDesc desc;
-//             if (input_pair.first->GetOutputDesc(0, desc) != 0) continue;
-//             auto shape = desc.GetShape();
-//             if (shape.GetDimNum() != 2) continue;
-
-//             int64_t k = shape.GetDim(0);
-//             int64_t n = shape.GetDim(1);
-//             if (k <= 65536 && n <= 65536) continue;
-//             if (desc.GetFormat() == FORMAT_FRACTAL_NZ) continue;
-
-//             // Operator trans_op("TransData");
-//             // trans_op.SetAttr("src_format", "ND");
-//             // trans_op.SetAttr("dst_format", "FRACTAL_NZ");
-//             // trans_op.SetAttr("src_subformat", (int64_t)0);
-//             // trans_op.SetAttr("dst_subformat", (int64_t)0);
-//             // trans_op.SetAttr("groups", (int64_t)1);
-//             op::TransData trans_op;
-//             trans_op.set_attr_src_format("ND");
-//             trans_op.set_attr_dst_format("FRACTAL_NZ");
-
-
-//             TensorDesc trans_in_desc;
-//             trans_in_desc.SetDataType(desc.GetDataType());
-//             trans_in_desc.SetFormat(FORMAT_ND);
-//             trans_in_desc.SetShape(shape);
-//             trans_op.UpdateInputDesc("src", trans_in_desc);
-
-//             TensorDesc trans_out_desc;
-//             trans_out_desc.SetDataType(desc.GetDataType());
-//             trans_out_desc.SetFormat(FORMAT_FRACTAL_NZ);
-//             Shape nz_shape({
-//                 (n + 15) / 16,
-//                 (k + 15) / 16,
-//                 16,
-//                 16,
-//             });
-//             trans_out_desc.SetShape(nz_shape);
-//             trans_op.UpdateOutputDesc("dst", trans_out_desc);
-
-//             GNode trans_node = graph->AddNodeByOp(trans_op);
-
-//             graph->RemoveEdge(*input_pair.first, input_pair.second,
-//                               node, i);
-//             graph->AddDataEdge(*input_pair.first, input_pair.second,
-//                                trans_node, 0);
-//             graph->AddDataEdge(trans_node, 0, node, i);
-
-//             AscendString const_name;
-//             input_pair.first->GetName(const_name);
-//             std::cout << "[NzWeightPass] Inserted TransData(ND->FRACTAL_NZ) for "
-//                       << "Const[" << const_name.GetString()
-//                       << " K=" << k << ",N=" << n << "] -> "
-//                       << op_type << std::endl;
-//             inserted++;
-//         }
-//     }
-//     std::cout << "[NzWeightPass] Pass done: inserted=" << inserted << std::endl;
-//     return SUCCESS;
-// }
-
-// REGISTER_CUSTOM_PASS("NzWeightPass")
-//     .CustomPassFn(NzWeightPass)
-//     .Stage(CustomPassStage::kAfterOriginGraphOptimize);
-
 REGISTER_CUSTOM_PASS("MatMulWeightNZPass")
     .CustomPassFn(MatMulWeightNZPass)
-    .Stage(CustomPassStage::kAfterBuiltinFusionPass);
+    .Stage(CustomPassStage::kAfterOriginGraphOptimize);
