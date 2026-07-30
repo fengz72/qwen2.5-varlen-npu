@@ -10,6 +10,7 @@
 """
 
 import os
+import json
 import logging
 import argparse
 import subprocess
@@ -72,8 +73,44 @@ DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
 DEFAULT_MODEL_NAME = "qwen2.5-0.5b"
 DEFAULT_OUTPUT_DIR = "atb/models/qwen2.5-0.5b/air"
 DEFAULT_OM_DIR = "atb/models/qwen2.5-0.5b/om"
+DEFAULT_TARGET_TOKEN_FILE = "atb/models/qwen2.5-0.5b/config/target_tokens.json"
 DEFAULT_SOC = "Ascend910_9382"
 DEFAULT_DEVICE = 8
+
+
+def load_target_tokens(json_path):
+    """加载 target token JSON, 返回 token_ids 列表。"""
+    with open(json_path) as f:
+        data = json.load(f)
+    token_ids = data["token_ids"]
+    assert len(token_ids) > 0, "token_ids 不能为空"
+    print(f"[prune] target token_ids: {token_ids}")
+    return token_ids
+
+
+def prune_lm_head(model, token_ids):
+    """裁剪 lm_head 仅保留 token_ids 对应的行。
+
+    输出维度从 vocab_size 降为 len(token_ids)。
+    若模型 tie_word_embeddings=True, 先 clone 解绑再裁剪, 不影响 embed_tokens。
+    """
+    if getattr(model.config, 'tie_word_embeddings', False):
+        model.lm_head.weight = nn.Parameter(
+            model.model.embed_tokens.weight.data.clone()
+        )
+        print("[prune] 解除 lm_head/embed_tokens weight tying")
+
+    device = model.lm_head.weight.device
+    target_ids_t = torch.tensor(token_ids, dtype=torch.long, device=device)
+    pruned_weight = model.lm_head.weight.data.index_select(0, target_ids_t).clone()
+
+    hidden_size = model.config.hidden_size
+    new_lm_head = nn.Linear(hidden_size, len(token_ids), bias=False)
+    new_lm_head.weight = nn.Parameter(pruned_weight)
+    model.lm_head = new_lm_head.npu().half()
+    model.config.vocab_size = len(token_ids)
+
+    print(f"[prune] lm_head: [{len(token_ids)}, {hidden_size}]")
 
 
 class ExportWrapper(nn.Module):
@@ -127,22 +164,26 @@ class ExportWrapper(nn.Module):
         return self.model.lm_head(last_hidden)
 
 
-def export_air(model_path, output_dir, device, batch_size, seq_len, export_name="qwen2.5-0.5b"):
+def export_air(model_path, output_dir, device, batch_size, seq_len,
+               export_name="qwen2.5-0.5b", prune=False, target_token_file=None):
     """导出 AIR 模型。
 
     流程:
       1. 加载模型 (NPU, npu_fia, fp16) — 与 graph_fused 推理模式一致
       2. 应用融合算子 (RMSNorm + RoPE)
+      2.1 lm_head vocab 剪裁 (可选)
       3. 设置 varlen 参数 (actual_seq_lengths, atten_mask, cos/sin 预计算)
       4. 包装模型 (ExportWrapper, 只返回 logits)
       5. dynamo_export 导出 AIR (动态 shape)
 
     Args:
-        model_path:  模型路径
-        output_dir:  AIR 输出目录
-        device:      NPU 设备号
-        batch_size:  batch size
-        seq_len:     每条文本近似 token 数
+        model_path:        模型路径
+        output_dir:        AIR 输出目录
+        device:            NPU 设备号
+        batch_size:        batch size
+        seq_len:           每条文本近似 token 数
+        prune:             是否开启 lm_head vocab 剪裁
+        target_token_file: target token JSON 文件路径 (prune=True 时必填)
     """
     torch.npu.set_device(device)
     # torch.npu.config.allow_internal_format = True
@@ -163,6 +204,14 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, export_name=
 
     # 2.1 patch attention forward, 用 -1 替代 q_len 避免 Pack
     patch_attention_for_dynamic()
+
+    # 2.2 lm_head vocab 剪裁
+    token_ids = None
+    if prune:
+        if not target_token_file or not os.path.exists(target_token_file):
+            raise FileNotFoundError(f"target_token_file 不存在: {target_token_file}")
+        token_ids = load_target_tokens(target_token_file)
+        prune_lm_head(model, token_ids)
 
     # # 2.2 lm_head.weight 预转 FRACTAL_NZ + register_buffer 固定为常量
     # with torch.no_grad():
@@ -246,6 +295,19 @@ def export_air(model_path, output_dir, device, batch_size, seq_len, export_name=
             print(f"  dynamo.pbtxt 已生成: {pbtxt_path}")
         print("  请检查上方日志中的 'export error!' 信息\n")
 
+    if token_ids:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        token_names = [tokenizer.decode([tid]) for tid in token_ids]
+        map_path = os.path.join(output_dir, f"{export_name}_vocab_map.json")
+        with open(map_path, "w") as f:
+            json.dump({
+                "original_token_ids": token_ids,
+                "token_names": token_names,
+                "pruned_vocab_size": len(token_ids),
+            }, f, indent=2, ensure_ascii=False)
+        print(f"=== vocab map 已保存: {map_path} ===\n")
+
     return air_path
 
 
@@ -315,6 +377,10 @@ def main():
     parser.add_argument("--skip-export", action="store_true",
                         help="跳过导出, 直接用已有 AIR 做 ATC 编译")
     parser.add_argument("--debug", action="store_true", help="ATC 编译时开启 --log=debug")
+    parser.add_argument("--prune-lm-head", action="store_true",
+                        help="开启 lm_head vocab 剪裁")
+    parser.add_argument("--target-token-file", default=DEFAULT_TARGET_TOKEN_FILE,
+                        help=f'target token JSON 文件 (默认: {DEFAULT_TARGET_TOKEN_FILE})')
     args = parser.parse_args()
 
     air_path = os.path.join(args.output_dir, f"{args.model_name}.air")
@@ -331,6 +397,8 @@ def main():
             args.batch_size,
             args.seq_len,
             export_name=args.model_name,
+            prune=args.prune_lm_head,
+            target_token_file=args.target_token_file,
         )
 
     if args.run_atc:
