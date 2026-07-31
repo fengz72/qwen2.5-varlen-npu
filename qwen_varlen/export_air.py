@@ -311,7 +311,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
     return air_path
 
 
-def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
+def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False, aicore_num=None):
     """执行 ATC 命令将 AIR 编译为 OM。
 
     --framework=1 表示输入为 AIR 格式 (GE 原生图格式)。
@@ -319,10 +319,17 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
     使用自定义 Pass (NzWeightPass) 在 Const→MatMul 间插入 TransData,
     利用常量折叠在编译期完成大权重 ND→FRACTAL_NZ 转换, 消除运行时 TransData。
     NzWeightPass 已安装到 CANN opp/vendors/custom_nz_pass/custom_fusion_passes/。
+
+    aicore_num: 限制目标设备运行时使用的 AICore 数量, None 则用硬件默认值。
+                指定时 OM 文件名追加 _aicore{N} 后缀, 避免覆盖。
     """
     os.makedirs(om_dir, exist_ok=True)
     air_basename = os.path.splitext(os.path.basename(air_path))[0]
-    om_output = os.path.join(om_dir, air_basename)
+    if aicore_num:
+        om_name = f"{air_basename}_aicore{aicore_num}"
+    else:
+        om_name = air_basename
+    om_output = os.path.join(om_dir, om_name)
 
     cmd = (
         f"atc --framework=1"
@@ -332,6 +339,9 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
     )
     if input_shape:
         cmd += f' --input_shape="{input_shape}"'
+
+    if aicore_num:
+        cmd += f' --aicore_num={aicore_num}'
 
     if is_debug:
         cmd += f' --log=debug'
@@ -373,6 +383,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=10, help="batch size")
     parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
+    parser.add_argument("--aicore-num", type=int, default=None,
+                        help="限制运行时 AICore 数量 (如 16), 默认不限制")
     parser.add_argument("--run-atc", action="store_true", help="自动执行 ATC 编译")
     parser.add_argument("--skip-export", action="store_true",
                         help="跳过导出, 直接用已有 AIR 做 ATC 编译")
@@ -402,7 +414,8 @@ def main():
         )
 
     if args.run_atc:
-        om_path = run_atc(air_path, args.om_dir, args.soc, is_debug=args.debug)
+        om_path = run_atc(air_path, args.om_dir, args.soc,
+                          is_debug=args.debug, aicore_num=args.aicore_num)
         if om_path:
             print(f"=== 全流程完成 ===")
             print(f"  AIR: {air_path}")

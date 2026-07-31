@@ -36,10 +36,6 @@ static bool ValidateWeightShape(const Shape &shape, int64_t &k_dim, int64_t &n_d
     }
     k_dim = shape.GetDim(0);
     n_dim = shape.GetDim(1);
-    if (n_dim < 65536) {
-        std::cout << "the weight inner axis is less 65536" << std::endl;
-        return false;
-    }
     return true;
 }
 
@@ -186,11 +182,7 @@ static Status ReplaceWithMatMulV3(GraphPtr &graph, GNode &node,
 
     // 补齐核类型属性：GE后续pass会将MatMulV3的_cube_vector_core_type推断为"MIX"，
     // 而MatMul应为"AiCore"，需从原节点继承避免算子调度到错误核类型
-    AscendString cube_vector_core_type;
-    node.GetAttr(AscendString("_cube_vector_core_type"), cube_vector_core_type);
-    if (std::string(cube_vector_core_type.GetString()).empty()) {
-        cube_vector_core_type = AscendString("AiCore");
-    }
+    AscendString cube_vector_core_type("MIX_AIC");
     mm_v3_node.SetAttr(AscendString("_cube_vector_core_type"), cube_vector_core_type);
     mm_v3_node.SetAttr(AscendString("_sgt_cube_vector_core_type"), cube_vector_core_type);
 
