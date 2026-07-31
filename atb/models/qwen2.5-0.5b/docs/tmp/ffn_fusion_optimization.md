@@ -45,7 +45,7 @@ Cube 95.5% 的时间都在忙, 但其中只有 43.5% 在做 MAC, 剩余 56.5% �
 
 ### 2.1 原始 FFN 融合逻辑
 
-代码位于 `qwen_varlen/fusion_ops.py`, `npu_ffn` 将整个 MLP 融合为 1 个算子:
+代码位于 `model/fusion_ops.py`, `npu_ffn` 将整个 MLP 融合为 1 个算子:
 
 ```
 npu_ffn(x, w1, w2, activation='swiglu') → 1 个算子
@@ -68,11 +68,11 @@ out  = self.down_proj(inter) # MatMul  [2080,4864]@[4864,896] → [2080,896]
 
 ### 2.3 代码改动
 
-#### `qwen_varlen/fusion_ops.py`
+#### `model/fusion_ops.py`
 - `apply_fusion_ops()` 增加 `fuse_ffn=True` 参数
 - `fuse_ffn=False` 时不 patch `Qwen2MLP.forward`, 保留原始小算子实现
 
-#### `qwen_varlen/export_air.py`
+#### `model/export_air.py`
 - 增加 `--no-ffn-fusion` CLI flag
 - `export_air()` 透传 `fuse_ffn` 给 `apply_fusion_ops()`
 - `verify_air()` 增加 `fuse_ffn` 分支, 调整期望算子数
@@ -178,7 +178,7 @@ GE 编译器将 SiLU + Mul 自动融合为 `EltwiseBroadcastFusionOp` (1 个 Vec
 
 ```bash
 # 1. 导出 AIR + ATC 编译 (不融合 FFN)
-python -m qwen_varlen.export_air \
+PYTHONPATH=atb/models/qwen2.5-0.5b python -m model.export_air \
     --dynamic --run-atc --verify \
     --no-ffn-fusion \
     --model-name qwen2.5-0.5b-no-ffn \

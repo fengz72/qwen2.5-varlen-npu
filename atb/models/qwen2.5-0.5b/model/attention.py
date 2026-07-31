@@ -27,15 +27,13 @@ def npu_fia_varlen_forward(module, query, key, value, attention_mask,
       actual_seq_lengths 以 tensor 传入, 避免 dynamo specialize, 配合 dynamic=True
     - eager 模式: torch_npu.npu_fused_infer_attention_score (支持 eager 执行)
     """
+    n = int(query.shape[1])
+    n_kv = int(key.shape[1])
     if query.dim() == 4:
-        n = int(query.shape[1])
-        n_kv = int(key.shape[1])
         q_t = query.permute(0, 2, 1, 3).squeeze(0).contiguous()
         k_t = key.permute(0, 2, 1, 3).squeeze(0).contiguous()
         v_t = value.permute(0, 2, 1, 3).squeeze(0).contiguous()
     else:
-        n = int(query.shape[1])
-        n_kv = int(key.shape[1])
         q_t = query.contiguous()
         k_t = key.contiguous()
         v_t = value.contiguous()

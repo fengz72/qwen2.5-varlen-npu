@@ -29,11 +29,6 @@
 
 set -e
 
-export DUMP_GRAPH_PATH="./dump_graph"
-export PRINT_MODEL=1
-export DUMP_GE_GRAPH=2
-export DUMP_GRAPH_LEVEL=2
-
 plogFlag=false
 if [ $plogFlag == true ]; then
   echo "plog open!!!"

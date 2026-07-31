@@ -177,12 +177,6 @@ class PrecisionComparator:
         return metrics
 
 
-import argparse
-import os
-import sys
-import numpy as np
-
-
 DTYPE_MAP = {
     'float16': np.float16,
     'float32': np.float32,

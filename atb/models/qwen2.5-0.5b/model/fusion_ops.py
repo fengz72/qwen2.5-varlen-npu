@@ -15,7 +15,7 @@
       远超 MatMul 节省 (243us/iter), 整体慢 8.6%。
 
 用法:
-    from qwen_varlen.fusion_ops import apply_fusion_ops
+    from model.fusion_ops import apply_fusion_ops
     apply_fusion_ops(model)  # 在模型加载后、编译前调用
 """
 
@@ -71,15 +71,12 @@ def _npu_rotary_emb_forward(self, x, position_ids):
 
 # ==================== 统一入口 ====================
 
-def apply_fusion_ops(model=None):
+def apply_fusion_ops():
     """应用全部融合算子替换 (monkey-patch)。
 
     在模型加载后、torch.compile 前调用。
-
-    Args:
-        model: 可选, 传入模型实例用于校验。实际 patch 作用于
-               transformers.models.qwen2.modeling_qwen2 模块级类/函数,
-               因此对已加载的模型立即生效。
+    patch 作用于 transformers.models.qwen2.modeling_qwen2 模块级类/函数,
+    因此对已加载的模型立即生效。
     """
     # 1. RMSNorm
     modeling_qwen2.Qwen2RMSNorm.forward = _npu_rms_norm_forward

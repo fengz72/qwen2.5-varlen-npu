@@ -50,7 +50,7 @@ npu-smi info
 ### 3.1 一键导出（推荐）
 
 ```bash
-python -m qwen_varlen.export_air \
+PYTHONPATH=atb/models/qwen2.5-0.5b python -m model.export_air \
     --device 0 \
     --dynamic \
     --run-atc \
@@ -141,13 +141,13 @@ OM 模型可通过 ACL（Ascend Computing Language）直接调用。本项目提
 - 预计算 `[1, MAX_SEQ_LEN, 64]` 的完整 cos/sin 表（MAX_SEQ_LEN=2048）
 - varlen 模式下每条序列的 position 从 0 重启：`pos = [0..L₁-1, 0..L₂-1, ...]`
 - 按 position_ids gather 得到 `[1, T, 64]`，T 为所有序列 token 总数
-- 预计算逻辑参见 `qwen_varlen/varlen_utils.py` 的 `precompute_rope_cos_sin`
+- 预计算逻辑参见 `model/varlen_utils.py` 的 `precompute_rope_cos_sin`
 
 使用以下命令生成测试数据（全 0 token，用于功能验证）：
 
 ```bash
 cd qwen2.5
-python -m qwen_varlen.prepare_air_inputs --device 0
+PYTHONPATH=atb/models/qwen2.5-0.5b python -m model.prepare_air_inputs --device 0
 ```
 
 ### 5.2 执行推理

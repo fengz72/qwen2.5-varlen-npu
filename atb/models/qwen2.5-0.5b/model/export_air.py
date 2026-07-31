@@ -2,21 +2,18 @@
 导出 AIR 模型 — PyTorch(NPU融合算子) → torchair.dynamo_export → AIR → ATC → OM
 
 导出链路: PyTorch → AIR → OM
-直接保留 NPU 融合算子 (FusedInferAttentionScore, FFN, RmsNorm, RotaryMul)。
+保留 NPU 融合算子 (FusedInferAttentionScore, RmsNorm, RotaryMul), FFN/QKV 保持小算子。
 
 用法:
-    python -m qwen_varlen.export_air --device 0
-    python -m qwen_varlen.export_air --device 0 --run-atc --soc Ascend910_9382
+    python -m model.export_air --device 0
+    python -m model.export_air --device 0 --run-atc --soc Ascend910_9382
 """
 
 import os
 import json
 import logging
 import argparse
-import subprocess
-import glob
 
-import numpy  # noqa: F401
 import torch
 import torch.nn as nn
 import torch_npu
@@ -26,8 +23,11 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2 import modeling_qwen2
 
 from .attention import register_npu_fia
-from .varlen_utils import generate_varlen_inputs, setup_varlen_attention
+from .varlen_utils import setup_varlen_attention
 from .fusion_ops import apply_fusion_ops
+from atb.tools.varlen import generate_varlen_inputs
+from atb.tools.atc_utils import run_atc
+from atb.tools.lm_head_prune import load_target_tokens, prune_lm_head
 
 
 def _patched_attention_forward(self, hidden_states, position_embeddings,
@@ -69,48 +69,34 @@ def patch_attention_for_dynamic():
     modeling_qwen2.Qwen2Attention.forward = _patched_attention_forward
     print("[patch] Qwen2Attention.forward → 动态导出版 (2D 模式, reshape 用 -1 避免 Pack)")
 
+
+def load_model(model_path, device):
+    """加载模型 (NPU, npu_fia, fp16), 应用融合算子 + attention patch。
+
+    export_air 和 prepare_air_inputs 共用此函数, 保证两条路径模型状态一致。
+    """
+    torch.npu.set_device(device)
+    register_npu_fia()
+    print(f"=== 加载模型 (attn_implementation='npu_fia', device={device}) ===")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, dtype=torch.float16, attn_implementation="npu_fia"
+    ).npu()
+    model.eval()
+    model.config.use_cache = False
+    print("=== 应用融合算子 ===")
+    apply_fusion_ops()
+    patch_attention_for_dynamic()
+    return model
+
+
+_MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
 DEFAULT_MODEL_NAME = "qwen2.5-0.5b"
-DEFAULT_OUTPUT_DIR = "atb/models/qwen2.5-0.5b/air"
-DEFAULT_OM_DIR = "atb/models/qwen2.5-0.5b/om"
-DEFAULT_TARGET_TOKEN_FILE = "atb/models/qwen2.5-0.5b/config/target_tokens.json"
+DEFAULT_OUTPUT_DIR = os.path.join(_MODEL_DIR, "air")
+DEFAULT_OM_DIR = os.path.join(_MODEL_DIR, "om")
+DEFAULT_TARGET_TOKEN_FILE = os.path.join(_MODEL_DIR, "target_tokens.json")
 DEFAULT_SOC = "Ascend910_9382"
 DEFAULT_DEVICE = 8
-
-
-def load_target_tokens(json_path):
-    """加载 target token JSON, 返回 token_ids 列表。"""
-    with open(json_path) as f:
-        data = json.load(f)
-    token_ids = data["token_ids"]
-    assert len(token_ids) > 0, "token_ids 不能为空"
-    print(f"[prune] target token_ids: {token_ids}")
-    return token_ids
-
-
-def prune_lm_head(model, token_ids):
-    """裁剪 lm_head 仅保留 token_ids 对应的行。
-
-    输出维度从 vocab_size 降为 len(token_ids)。
-    若模型 tie_word_embeddings=True, 先 clone 解绑再裁剪, 不影响 embed_tokens。
-    """
-    if getattr(model.config, 'tie_word_embeddings', False):
-        model.lm_head.weight = nn.Parameter(
-            model.model.embed_tokens.weight.data.clone()
-        )
-        print("[prune] 解除 lm_head/embed_tokens weight tying")
-
-    device = model.lm_head.weight.device
-    target_ids_t = torch.tensor(token_ids, dtype=torch.long, device=device)
-    pruned_weight = model.lm_head.weight.data.index_select(0, target_ids_t).clone()
-
-    hidden_size = model.config.hidden_size
-    new_lm_head = nn.Linear(hidden_size, len(token_ids), bias=False)
-    new_lm_head.weight = nn.Parameter(pruned_weight)
-    model.lm_head = new_lm_head.npu().half()
-    model.config.vocab_size = len(token_ids)
-
-    print(f"[prune] lm_head: [{len(token_ids)}, {hidden_size}]")
 
 
 class ExportWrapper(nn.Module):
@@ -185,49 +171,18 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
         prune:             是否开启 lm_head vocab 剪裁
         target_token_file: target token JSON 文件路径 (prune=True 时必填)
     """
-    torch.npu.set_device(device)
-    # torch.npu.config.allow_internal_format = True
     logging.getLogger('torchair').setLevel(logging.INFO)
 
     # 1. 加载模型 (NPU, npu_fia, fp16)
-    register_npu_fia()
-    print(f"=== 加载模型 (attn_implementation='npu_fia', device={device}) ===")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype=torch.float16, attn_implementation="npu_fia"
-    ).npu()
-    model.eval()
-    model.config.use_cache = False
+    model = load_model(model_path, device)
 
-    # 2. 应用融合算子
-    print("=== 应用融合算子 ===")
-    apply_fusion_ops(model)
-
-    # 2.1 patch attention forward, 用 -1 替代 q_len 避免 Pack
-    patch_attention_for_dynamic()
-
-    # 2.2 lm_head vocab 剪裁
+    # 2. lm_head vocab 剪裁
     token_ids = None
     if prune:
         if not target_token_file or not os.path.exists(target_token_file):
             raise FileNotFoundError(f"target_token_file 不存在: {target_token_file}")
         token_ids = load_target_tokens(target_token_file)
         prune_lm_head(model, token_ids)
-
-    # # 2.2 lm_head.weight 预转 FRACTAL_NZ + register_buffer 固定为常量
-    # with torch.no_grad():
-    #     if getattr(model.config, 'tie_word_embeddings', False):
-    #         weight_data = model.model.embed_tokens.weight.data.clone()
-    #         print("[nz] 解除 lm_head/embed_tokens weight tying (clone)")
-    #     else:
-    #         weight_data = model.lm_head.weight.data.clone()
-    #     del model.lm_head.weight
-    #     model.lm_head.register_buffer('weight', weight_data)
-    #     model.lm_head.weight = torch_npu.npu_format_cast(
-    #         model.lm_head.weight, torch_npu.Format.FRACTAL_NZ
-    #     )
-    #     print(f"[nz] lm_head.weight → register_buffer + FRACTAL_NZ "
-    #           f"(format={torch_npu.get_npu_format(model.lm_head.weight)}, "
-    #           f"type={type(model.lm_head.weight).__name__})")
 
     # 3. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
     concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
@@ -309,68 +264,6 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
         print(f"=== vocab map 已保存: {map_path} ===\n")
 
     return air_path
-
-
-def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False, aicore_num=None):
-    """执行 ATC 命令将 AIR 编译为 OM。
-
-    --framework=1 表示输入为 AIR 格式 (GE 原生图格式)。
-    OM 输出到 om_dir 目录, 文件名与 AIR 相同。
-    使用自定义 Pass (NzWeightPass) 在 Const→MatMul 间插入 TransData,
-    利用常量折叠在编译期完成大权重 ND→FRACTAL_NZ 转换, 消除运行时 TransData。
-    NzWeightPass 已安装到 CANN opp/vendors/custom_nz_pass/custom_fusion_passes/。
-
-    aicore_num: 限制目标设备运行时使用的 AICore 数量, None 则用硬件默认值。
-                指定时 OM 文件名追加 _aicore{N} 后缀, 避免覆盖。
-    """
-    os.makedirs(om_dir, exist_ok=True)
-    air_basename = os.path.splitext(os.path.basename(air_path))[0]
-    if aicore_num:
-        om_name = f"{air_basename}_aicore{aicore_num}"
-    else:
-        om_name = air_basename
-    om_output = os.path.join(om_dir, om_name)
-
-    cmd = (
-        f"atc --framework=1"
-        f" --model={air_path}"
-        f" --output={om_output}"
-        f" --soc_version={soc}"
-    )
-    if input_shape:
-        cmd += f' --input_shape="{input_shape}"'
-
-    if aicore_num:
-        cmd += f' --aicore_num={aicore_num}'
-
-    if is_debug:
-        cmd += f' --log=debug'
-
-    print(f"=== 执行 ATC 编译 ===")
-    print(f"  命令: {cmd}\n")
-
-    env = os.environ.copy()
-    numpy_site = os.path.dirname(os.path.dirname(numpy.__file__))
-    env['PYTHONPATH'] = f"{numpy_site}:{env.get('PYTHONPATH', '')}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-    print(result.stdout)
-    if result.returncode != 0:
-        print(f"[ERROR] ATC 编译失败:")
-        print(result.stderr[-3000:])
-        return None
-
-    om_file = om_output + ".om"
-    if not os.path.exists(om_file):
-        candidates = glob.glob(f"{om_output}*.om")
-        if candidates:
-            om_file = candidates[0]
-        else:
-            print(f"[ERROR] OM 文件未生成: {om_file}")
-            return None
-
-    file_size = os.path.getsize(om_file) / 1024 / 1024
-    print(f"=== OM 编译完成: {om_file} ({file_size:.1f} MB) ===\n")
-    return om_file
 
 
 def main():
