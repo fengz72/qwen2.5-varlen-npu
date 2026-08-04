@@ -21,7 +21,6 @@
 #   --profiling       开启 profiling (infer/bench 生效)
 #   --debug           ATC 编译开启 --log=debug
 #   --dump            ATC 编译开启 GE 图 dump
-#   --aicore-num N    限制运行时 AICore 数量 (如 12)
 #   --dry-run         只打印命令不执行
 #   -h, --help        显示帮助
 #
@@ -56,7 +55,6 @@ PRUNE=false
 PROFILING=false
 DEBUG=false
 DUMP=false
-AICORE_NUM=""
 DRY_RUN=false
 
 # ---- 颜色输出 ----
@@ -92,9 +90,8 @@ Options:
   --profiling       Enable profiling
   --debug           ATC --log=debug
   --dump            ATC GE graph dump
-  --aicore-num N    Limit AICore count (e.g. 12)
   --dry-run         Print commands without executing
-  -h, --help        Show this help
+  -h, --help        Show help
 
 Examples:
   ./run.sh all --profiling
@@ -119,7 +116,6 @@ parse_common_args() {
             --profiling)  PROFILING=true; shift ;;
             --debug)      DEBUG=true; shift ;;
             --dump)       DUMP=true; shift ;;
-            --aicore-num) AICORE_NUM="$2"; shift 2 ;;
             --dry-run)    DRY_RUN=true; shift ;;
             -h|--help)    usage; exit 0 ;;
             *)            log_error "Unknown option: $1"; usage; exit 1 ;;
@@ -179,8 +175,6 @@ do_atc() {
     fi
     local debug_flag=""
     [ "$DEBUG" = true ] && debug_flag="--debug"
-    local aicore_flag=""
-    [ -n "$AICORE_NUM" ] && aicore_flag="--aicore-num ${AICORE_NUM}"
     local dump_env=""
     if [ "$DUMP" = true ]; then
         local dump_dir="${MODEL_DIR}/dump_graph"
@@ -195,7 +189,7 @@ do_atc() {
         --output-dir ${AIR_DIR} \
         --om-dir ${OM_DIR} \
         --model-name ${MODEL_NAME} \
-        --soc ${SOC} ${debug_flag} ${aicore_flag}"
+        --soc ${SOC} ${debug_flag}"
 }
 
 # =============================================================================
@@ -217,14 +211,24 @@ do_infer() {
 do_bench() {
     log_step "Step 5: Latency benchmark (bench_latency)"
 
-    # 查找 OM 文件 (ATC 可能添加系统后缀)
-    local om_file="${OM_DIR}/${MODEL_NAME}_linux_aarch64.om"
+    # 查找 OM 文件
+    local om_file
+    om_file="${OM_DIR}/${MODEL_NAME}_linux_aarch64.om"
     if [ ! -f "$om_file" ]; then
         om_file=$(find "${OM_DIR}" -name "${MODEL_NAME}*.om" -type f 2>/dev/null | head -1)
     fi
     if [ ! -f "$om_file" ]; then
         log_error "OM not found in ${OM_DIR}, run './run.sh atc' first"
         exit 1
+    fi
+    log_info "OM: ${om_file}"
+
+    # Profiling 输出目录: 统一写到 PROFILING_DIR, parse 一次性解析所有
+    local profiling_args=""
+    if [ "$PROFILING" = true ]; then
+        mkdir -p "$PROFILING_DIR"
+        profiling_args="--profiling --profiling_output ${PROFILING_DIR}"
+        log_info "Profiling output: ${PROFILING_DIR}"
     fi
 
     cd "${ATB_DIR}"
@@ -233,7 +237,7 @@ do_bench() {
         --threads ${THREADS} \
         --requests ${REQUESTS} \
         --warmup ${WARMUP} \
-        --device-id ${DEVICE} $(prof_flag)"
+        --device-id ${DEVICE} ${profiling_args}"
 }
 
 # =============================================================================
@@ -243,7 +247,7 @@ do_parse() {
     log_step "Step 6: Parse profiling data"
     if [ ! -d "${PROFILING_DIR}" ]; then
         log_error "Profiling dir not found: ${PROFILING_DIR}"
-        log_error "Run with --profiling first"
+        log_error "Run './run.sh bench --profiling' first"
         exit 1
     fi
     cd "${ATB_DIR}"

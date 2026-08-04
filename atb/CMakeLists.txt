@@ -28,14 +28,6 @@ target_link_libraries(acl_infer
     stdc++
 )
 
-add_executable(bench_throughput bench_throughput.cpp)
-
-target_link_libraries(bench_throughput
-    ascendcl
-    stdc++
-    pthread
-)
-
 add_executable(bench_latency bench_latency.cpp)
 
 target_link_libraries(bench_latency
@@ -43,5 +35,3 @@ target_link_libraries(bench_latency
     stdc++
     pthread
 )
-
-install(TARGETS acl_infer bench_throughput bench_latency DESTINATION bin)

@@ -276,8 +276,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=10, help="batch size")
     parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
-    parser.add_argument("--aicore-num", type=int, default=None,
-                        help="限制运行时 AICore 数量 (如 16), 默认不限制")
     parser.add_argument("--run-atc", action="store_true", help="自动执行 ATC 编译")
     parser.add_argument("--skip-export", action="store_true",
                         help="跳过导出, 直接用已有 AIR 做 ATC 编译")
@@ -308,7 +306,7 @@ def main():
 
     if args.run_atc:
         om_path = run_atc(air_path, args.om_dir, args.soc,
-                          is_debug=args.debug, aicore_num=args.aicore_num)
+                          is_debug=args.debug)
         if om_path:
             print(f"=== 全流程完成 ===")
             print(f"  AIR: {air_path}")

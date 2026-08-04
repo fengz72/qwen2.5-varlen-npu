@@ -8,5 +8,6 @@ cd "$(dirname "$0")/atb/models/qwen2.5-0.5b"
 
 ./run.sh pass
 ./run.sh export --prune
-./run.sh atc --dump
-./run.sh infer --profiling
+./run.sh atc
+./run.sh bench --profiling --warmup 50 --requests 100
+./run.sh parse
