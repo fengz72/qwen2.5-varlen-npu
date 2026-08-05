@@ -1,20 +1,24 @@
 """
-为 AIR 导出的 OM 模型生成 4 个用户输入数据 + golden logits。
+为 AIR 导出的 OM 模型生成 7 个用户输入数据 + golden logits。
+
+prefix sharing 模式 (prefix_len > 0):
+  compact input_ids [T_c] = [prefix, req_1, ..., req_n] (省存储)
+  attention 内部 expand→QKV→Attn→restore (图内处理)
 
 frozen_parameter=1 后, FFN 权重和 atten_mask 已冻结为图常量,
-OM 只有 4 个图输入 (Data 节点):
-  - actual_seq_lengths [N] int64
-  - cos [1, T, 64] float16
-  - sin [1, T, 64] float16
-  - input_ids [T] int64
-
-(position_ids 虽是 forward 参数, 但因 cos/sin 图外预计算而在图中消除)
+OM 有 7 个图输入 (Data 节点):
+  - actual_seq_lengths   [N] int64    — expanded 累积序列长度
+  - cos                  [1, T_e, 64] fp16 — RoPE cos (expanded)
+  - sin                  [1, T_e, 64] fp16 — RoPE sin (expanded)
+  - input_ids            [T_c] int64  — compact token ids
+  - expand_index         [T_e] int64  — compact→expanded 映射
+  - restore_index        [T_c] int64  — expanded→compact 映射
+  - compact_last_indices [N] int64    — 每条序列最后 token 在 compact 中的位置
 
 cos/sin 预计算策略:
   1. 图外预计算 max_seq_len 的 cos/sin 表 [1, MAX_SEQ_LEN, 64] (一次)
-  2. 运行时按 position_ids gather: cos_table[:, pos, :] → [1, T, 64]
-     varlen 中每条 seq 的 position 从 0 重启: pos = [0..207, 0..207, ...]
-  3. 图输入 shape 不变 [1, -1, 64], OM 模型无需重新导出
+  2. 运行时按 expanded position_ids gather: cos_table[:, pos, :] → [1, T_e, 64]
+     varlen 中每条 seq 的 position 从 0 重启: pos = [0..S-1, 0..S-1, ...]
 
 同时运行 eager 模式生成 golden logits 供精度对比。
 """
@@ -25,8 +29,9 @@ import torch
 import torch_npu
 
 from .varlen_utils import setup_varlen_attention, precompute_rope_cos_sin
+from .varlen_utils import build_expand_index, build_restore_index, build_compact_last_indices
 from .export_air import load_model, ExportWrapper
-from atb.tools.varlen import generate_varlen_inputs
+from atb.tools.varlen import generate_compact_varlen_inputs, generate_varlen_inputs
 
 _MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
@@ -35,6 +40,7 @@ DEFAULT_DEVICE = 0
 
 BATCH_SIZE = 10
 SEQ_LEN = 208
+PREFIX_LEN = 25
 MAX_SEQ_LEN = 2048
 
 
@@ -43,54 +49,81 @@ def main():
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="模型路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
     parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
+    parser.add_argument("--prefix-len", type=int, default=PREFIX_LEN, help="共享前缀长度 (0 则不启用)")
     args = parser.parse_args()
+
+    prefix_len = args.prefix_len
 
     # 1. 加载模型 (与 export 完全一致)
     model = load_model(args.model_path, args.device)
 
-    # 2. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
-    concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
-        BATCH_SIZE, SEQ_LEN
-    )
+    # 2. 准备 varlen 输入
+    if prefix_len > 0:
+        compact_ids, expanded_pos, seq_lens, cum_seq_lens = generate_compact_varlen_inputs(
+            BATCH_SIZE, SEQ_LEN, prefix_len
+        )
+        t_expanded = cum_seq_lens[-1]
+        t_compact = compact_ids.shape[1]
+        print(f"prefix sharing: prefix_len={prefix_len}, T_compact={t_compact}, T_expanded={t_expanded}")
+    else:
+        compact_ids, expanded_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
+            BATCH_SIZE, SEQ_LEN
+        )
+        t_expanded = cum_seq_lens[-1]
+        t_compact = t_expanded
     setup_varlen_attention(model, cum_seq_lens, 'npu')
 
     print(f"seq_lens: {seq_lens[:5]}, cum_seq_lens: {cum_seq_lens}")
 
-    # 2.1 预计算 max_seq_len 的 cos/sin 表, 按 position_ids gather (varlen 每条 seq 从 0 重启)
+    # 2.1 预计算 max_seq_len 的 cos/sin 表, 按 expanded position_ids gather
     precompute_rope_cos_sin(model, MAX_SEQ_LEN, 'npu')
     cos_table = model.model.rotary_emb._cached_cos  # [1, MAX_SEQ_LEN, 64]
     sin_table = model.model.rotary_emb._cached_sin
-    pos = concat_pos.squeeze(0).npu()  # [T] = [0..207, 0..207, ...]
-    model.model.rotary_emb._cached_cos = cos_table[:, pos, :]  # [1, T, 64]
+    pos = expanded_pos.squeeze(0).npu()  # [T_e] = [0..S-1, 0..S-1, ...]
+    model.model.rotary_emb._cached_cos = cos_table[:, pos, :]  # [1, T_e, 64]
     model.model.rotary_emb._cached_sin = sin_table[:, pos, :]
     print(f"cos/sin gathered: table=[1,{MAX_SEQ_LEN},64] → pos={pos.shape} → cos={model.model.rotary_emb._cached_cos.shape}")
 
-    # 3. 生成 golden logits (eager 模式, 复用 ExportWrapper 保证与导出路径一致)
+    # 3. 构建 prefix sharing indices
+    if prefix_len > 0:
+        expand_index = build_expand_index(prefix_len, seq_lens, 'npu')
+        restore_index = build_restore_index(prefix_len, seq_lens, 'npu')
+        compact_last_indices = build_compact_last_indices(prefix_len, seq_lens, 'npu')
+    else:
+        expand_index = torch.arange(t_expanded, dtype=torch.int64, device='npu')
+        restore_index = torch.arange(t_compact, dtype=torch.int64, device='npu')
+        compact_last_indices = torch.tensor(cum_seq_lens, dtype=torch.int64, device='npu') - 1
+
+    # 4. 生成 golden logits (eager 模式, 复用 ExportWrapper 保证与导出路径一致)
     print("=== 生成 golden logits (仅每条序列最后一个 token) ===")
     asl_tensor = torch.tensor(cum_seq_lens, dtype=torch.int64, device='npu')
     cos = model.model.rotary_emb._cached_cos
     sin = model.model.rotary_emb._cached_sin
     with torch.no_grad():
         golden_logits = ExportWrapper(model)(
-            concat_ids.squeeze(0).npu(),
-            concat_pos.squeeze(0).npu(),
-            asl_tensor, cos, sin
+            compact_ids.squeeze(0).npu(),
+            expanded_pos.squeeze(0).npu(),
+            asl_tensor, cos, sin,
+            expand_index, restore_index, compact_last_indices,
         ).cpu()
     print(f"golden_logits shape: {golden_logits.shape}")
 
-    # 4. 收集 4 个用户输入 (按 OM Data 节点顺序)
+    # 5. 收集 7 个用户输入 (按 OM Data 节点顺序)
     inputs = [
         ("actual_seq_lengths", torch.tensor(cum_seq_lens, dtype=torch.int64).cpu()),
         ("cos", model.model.rotary_emb._cached_cos.cpu()),
         ("sin", model.model.rotary_emb._cached_sin.cpu()),
-        ("input_ids", concat_ids.squeeze(0).cpu()),
+        ("input_ids", compact_ids.squeeze(0).cpu()),
+        ("expand_index", expand_index.cpu()),
+        ("restore_index", restore_index.cpu()),
+        ("compact_last_indices", compact_last_indices.cpu()),
     ]
 
-    # 5. 保存
+    # 6. 保存
     os.makedirs(args.output_dir, exist_ok=True)
 
     list_lines = []
-    arg_names = ["arg1_1", "arg3_1", "arg5_1", "arg8_1"]
+    arg_names = ["arg1_1", "arg3_1", "arg5_1", "arg8_1", "arg9_1", "arg10_1", "arg11_1"]
     for idx, (name, tensor) in enumerate(inputs):
         fname = f"{name}.bin"
         fpath = os.path.join(args.output_dir, fname)
@@ -115,7 +148,7 @@ def main():
             f.write(line + "\n")
     print(f"\nInput list saved to: {list_path} ({len(inputs)} inputs)")
 
-    # 6. 保存 golden logits
+    # 7. 保存 golden logits
     golden_path = os.path.join(args.output_dir, "golden_logits.bin")
     golden_logits.detach().numpy().tofile(golden_path)
     print(f"Golden logits saved to: {golden_path}")

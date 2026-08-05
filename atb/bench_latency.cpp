@@ -112,6 +112,7 @@ static const double SEQ_LOG_STD  = 0.167;
 
 static bool   g_seq_fixed = false;
 static int    g_seq_fixed_val = 208;
+static int    g_prefix_len = 25;
 
 // ============================================================================
 // Timing helpers
@@ -202,11 +203,15 @@ struct CosSinTable {
 
 struct Request {
     int req_id;
-    std::vector<int64_t> input_ids;
-    std::vector<int64_t> actual_seq_lengths;
-    std::vector<uint16_t> cos_data;
-    std::vector<uint16_t> sin_data;
-    int total_tokens;
+    std::vector<int64_t> input_ids;          // compact [T_c]
+    std::vector<int64_t> actual_seq_lengths; // expanded cumsum [N]
+    std::vector<int64_t> expand_index;       // [T_e] compact→expanded
+    std::vector<int64_t> restore_index;      // [T_c] expanded→compact
+    std::vector<int64_t> compact_last_indices; // [N]
+    std::vector<uint16_t> cos_data;          // expanded [1, T_e, 64]
+    std::vector<uint16_t> sin_data;          // expanded [1, T_e, 64]
+    int total_tokens;    // T_e (expanded)
+    int compact_tokens;  // T_c (compact)
     int batch_size;
 
     // Per-stage timing
@@ -254,7 +259,14 @@ public:
         }
         req.total_tokens = total;
 
-        req.input_ids.resize(total, 0);
+        int prefix_len = g_prefix_len;
+        int compact = prefix_len;
+        for (int i = 0; i < bs; i++) {
+            compact += std::max(0, seq_lens[i] - prefix_len);
+        }
+        req.compact_tokens = compact;
+
+        req.input_ids.resize(compact, 0);
 
         req.actual_seq_lengths.resize(bs);
         int acc = 0;
@@ -272,6 +284,43 @@ public:
         }
 
         table_.gather(pos_ids, req.cos_data, req.sin_data);
+
+        req.expand_index.resize(total);
+        int eidx = 0;
+        int compact_req_offset = prefix_len;
+        for (int i = 0; i < bs; i++) {
+            int req_tokens = std::max(0, seq_lens[i] - prefix_len);
+            for (int p = 0; p < prefix_len; p++) {
+                req.expand_index[eidx++] = p;
+            }
+            for (int p = 0; p < req_tokens; p++) {
+                req.expand_index[eidx++] = compact_req_offset + p;
+            }
+            compact_req_offset += req_tokens;
+        }
+
+        req.restore_index.resize(compact);
+        int ridx = 0;
+        for (int p = 0; p < prefix_len; p++) {
+            req.restore_index[ridx++] = p;
+        }
+        int block_start = 0;
+        for (int i = 0; i < bs; i++) {
+            int req_tokens = std::max(0, seq_lens[i] - prefix_len);
+            int req_start = block_start + prefix_len;
+            for (int p = 0; p < req_tokens; p++) {
+                req.restore_index[ridx++] = req_start + p;
+            }
+            block_start += seq_lens[i];
+        }
+
+        req.compact_last_indices.resize(bs);
+        int compact_offset = prefix_len;
+        for (int i = 0; i < bs; i++) {
+            int req_tokens = std::max(0, seq_lens[i] - prefix_len);
+            req.compact_last_indices[i] = compact_offset + req_tokens - 1;
+            compact_offset += req_tokens;
+        }
 
         return req;
     }
@@ -427,6 +476,9 @@ public:
             {ACL_FLOAT16, {1, MAX_TOTAL_TOKENS, HEAD_DIM},     (size_t)1 * MAX_TOTAL_TOKENS * HEAD_DIM * 2},
             {ACL_FLOAT16, {1, MAX_TOTAL_TOKENS, HEAD_DIM},     (size_t)1 * MAX_TOTAL_TOKENS * HEAD_DIM * 2},
             {ACL_INT64,   {MAX_TOTAL_TOKENS},                  (size_t)MAX_TOTAL_TOKENS * 8},
+            {ACL_INT64,   {MAX_TOTAL_TOKENS},                  (size_t)MAX_TOTAL_TOKENS * 8},
+            {ACL_INT64,   {MAX_TOTAL_TOKENS},                  (size_t)MAX_TOTAL_TOKENS * 8},
+            {ACL_INT64,   {MAX_BATCH_SIZE},                    (size_t)MAX_BATCH_SIZE * 8},
         };
         output_max_bytes = (size_t)MAX_BATCH_SIZE * VOCAB_SIZE * 2;
         model_path_ = model_path;
@@ -479,7 +531,7 @@ public:
             std::vector<int64_t> shape;
         };
 
-        InputData inputs[4] = {
+        InputData inputs[7] = {
             {req.actual_seq_lengths.data(), req.actual_seq_lengths.size() * 8, ACL_INT64,
              {static_cast<int64_t>(req.actual_seq_lengths.size())}},
             {req.cos_data.data(), req.cos_data.size() * 2, ACL_FLOAT16,
@@ -487,10 +539,16 @@ public:
             {req.sin_data.data(), req.sin_data.size() * 2, ACL_FLOAT16,
              {1, static_cast<int64_t>(req.total_tokens), HEAD_DIM}},
             {req.input_ids.data(), req.input_ids.size() * 8, ACL_INT64,
-             {static_cast<int64_t>(req.total_tokens)}},
+             {static_cast<int64_t>(req.input_ids.size())}},
+            {req.expand_index.data(), req.expand_index.size() * 8, ACL_INT64,
+             {static_cast<int64_t>(req.expand_index.size())}},
+            {req.restore_index.data(), req.restore_index.size() * 8, ACL_INT64,
+             {static_cast<int64_t>(req.restore_index.size())}},
+            {req.compact_last_indices.data(), req.compact_last_indices.size() * 8, ACL_INT64,
+             {static_cast<int64_t>(req.compact_last_indices.size())}},
         };
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 7; i++) {
             if (inputs[i].bytes > input_max_sizes[i]) {
                 std::cerr << "[ERROR] Input " << i << " size " << inputs[i].bytes
                           << " > buffer " << input_max_sizes[i] << std::endl;
@@ -752,6 +810,7 @@ static void print_usage(const char* prog) {
               << "  --device-id <id>     NPU device ID (default: 0)\n"
               << "  --warmup <N>         Warmup requests (default: 50)\n"
               << "  --fixed-seq <len>    Fix all sequence lengths to <len> (default: random)\n"
+              << "  --prefix-len <len>  Shared prefix length (default: 25)\n"
               << "  --profiling          Enable CANN profiling (generates acl.json)\n"
               << "  --profiling_output <dir>  Profiling output directory (default: ./profiling_data)\n"
               << "  --profiling_no_task_time    Disable task_time collection\n"
@@ -790,6 +849,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--fixed-seq" && i + 1 < argc) {
             g_seq_fixed = true;
             g_seq_fixed_val = std::stoi(argv[++i]);
+        } else if (arg == "--prefix-len" && i + 1 < argc) {
+            g_prefix_len = std::stoi(argv[++i]);
         } else if (arg == "--profiling") {
             // handled by ParseProfilingConfig
         } else if (arg == "--profiling_output" && i + 1 < argc) {

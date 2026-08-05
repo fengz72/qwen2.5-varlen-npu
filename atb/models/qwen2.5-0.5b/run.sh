@@ -19,6 +19,7 @@
 #   --threads N       bench 线程数 (默认 1)
 #   --prune           开启 lm_head vocab 剪裁
 #   --fixed-seq <len> 固定序列长度 (默认随机)
+#   --prefix-len N    共享前缀长度 (默认 25, 0 则不启用 prefix sharing)
 #   --profiling       开启 profiling (infer/bench 生效)
 #   --debug           ATC 编译开启 --log=debug
 #   --dump            ATC 编译开启 GE 图 dump
@@ -54,6 +55,7 @@ REQUESTS=100
 THREADS=1
 PRUNE=false
 FIXED_SEQ=""
+PREFIX_LEN=25
 PROFILING=false
 DEBUG=false
 DUMP=false
@@ -90,6 +92,7 @@ Options:
   --threads N       Benchmark threads (default: 1)
   --prune           Enable lm_head vocab pruning
   --fixed-seq <len> Fixed sequence length (default: random)
+  --prefix-len N    Shared prefix length (default: 25, 0 disables)
   --profiling       Enable profiling
   --debug           ATC --log=debug
   --dump            ATC GE graph dump
@@ -117,6 +120,7 @@ parse_common_args() {
             --threads)    THREADS="$2"; shift 2 ;;
             --prune)      PRUNE=true; shift ;;
             --fixed-seq)  FIXED_SEQ="$2"; shift 2 ;;
+            --prefix-len) PREFIX_LEN="$2"; shift 2 ;;
             --profiling)  PROFILING=true; shift ;;
             --debug)      DEBUG=true; shift ;;
             --dump)       DUMP=true; shift ;;
@@ -162,7 +166,8 @@ do_export() {
         --output-dir ${AIR_DIR} \
         --om-dir ${OM_DIR} \
         --model-name ${MODEL_NAME} \
-        --soc ${SOC} ${prune_flag}"
+        --soc ${SOC} \
+        --prefix-len ${PREFIX_LEN} ${prune_flag}"
     if [ "$DRY_RUN" != true ]; then
         [ -f "${AIR_PATH}" ] && log_info "AIR exported: ${AIR_PATH}" || log_error "AIR not found: ${AIR_PATH}"
     fi
@@ -193,7 +198,8 @@ do_atc() {
         --output-dir ${AIR_DIR} \
         --om-dir ${OM_DIR} \
         --model-name ${MODEL_NAME} \
-        --soc ${SOC} ${debug_flag}"
+        --soc ${SOC} \
+        --prefix-len ${PREFIX_LEN} ${debug_flag}"
 }
 
 # =============================================================================
@@ -244,6 +250,7 @@ do_bench() {
         --threads ${THREADS} \
         --requests ${REQUESTS} \
         --warmup ${WARMUP} \
+        --prefix-len ${PREFIX_LEN} \
         --device-id ${DEVICE} ${fixed_seq_flag} ${profiling_args}"
 }
 

@@ -1,5 +1,5 @@
 """
-变长 (varlen) 模型相关处理 — attention 参数注入、cos/sin 预计算
+变长 (varlen) 模型相关处理 — attention 参数注入、cos/sin 预计算, prefix sharing index 构建。
 
 通用 token 拼接工具已提取到 atb.tools.varlen。
 """
@@ -7,6 +7,62 @@
 import torch
 
 from .attention import build_causal_mask_2048
+
+
+# ==================== Prefix sharing index 构建 ====================
+
+def build_expand_index(prefix_len, seq_lens, device):
+    """构建 expand index: compact → expanded 的位置映射。
+
+    compact:  [prefix, req_0, req_1, ..., req_n]
+    expanded: [prefix, req_0, prefix, req_1, ..., prefix, req_n]
+
+    index[i] = expanded 位置 i 对应的 compact 位置
+    返回长度 = T_expanded = sum(seq_lens)
+    """
+    indices = []
+    compact_req_offset = prefix_len
+    for sl in seq_lens:
+        req_tokens = sl - prefix_len
+        indices.append(torch.arange(prefix_len, device=device))
+        indices.append(torch.arange(compact_req_offset, compact_req_offset + req_tokens, device=device))
+        compact_req_offset += req_tokens
+    return torch.cat(indices).to(torch.int64)
+
+
+def build_restore_index(prefix_len, seq_lens, device):
+    """构建 restore index: expanded → compact 的位置映射。
+
+    compact:  [prefix, req_0, req_1, ..., req_n]
+    expanded: [prefix, req_0, prefix, req_1, ..., prefix, req_n]
+
+    index[i] = compact 位置 i 对应的 expanded 位置
+    返回长度 = T_compact = prefix_len + sum(seq_lens - prefix_len)
+    """
+    prefix_idx = torch.arange(prefix_len, device=device)
+    req_indices = []
+    block_start = 0
+    for sl in seq_lens:
+        req_tokens = sl - prefix_len
+        req_start = block_start + prefix_len
+        req_indices.append(torch.arange(req_start, req_start + req_tokens, device=device))
+        block_start += sl
+    return torch.cat([prefix_idx] + req_indices).to(torch.int64)
+
+
+def build_compact_last_indices(prefix_len, seq_lens, device):
+    """构建 compact last indices: 每个请求最后一个 token 在 compact 中的位置。
+
+    compact: [prefix, req_0, req_1, ..., req_n]
+    返回长度 = n = len(seq_lens)
+    """
+    indices = []
+    compact_offset = prefix_len
+    for sl in seq_lens:
+        req_tokens = sl - prefix_len
+        indices.append(compact_offset + req_tokens - 1)
+        compact_offset += req_tokens
+    return torch.tensor(indices, dtype=torch.int64, device=device)
 
 
 def precompute_rope_cos_sin(model, total_len, device):

@@ -24,24 +24,34 @@ from transformers.models.qwen2 import modeling_qwen2
 
 from .attention import register_npu_fia
 from .varlen_utils import setup_varlen_attention
+from .varlen_utils import build_expand_index, build_restore_index, build_compact_last_indices
 from .fusion_ops import apply_fusion_ops
-from atb.tools.varlen import generate_varlen_inputs
+from atb.tools.varlen import generate_varlen_inputs, generate_compact_varlen_inputs
 from atb.tools.atc_utils import run_atc
 from atb.tools.lm_head_prune import load_target_tokens, prune_lm_head
 
 
 def _patched_attention_forward(self, hidden_states, position_embeddings,
                                attention_mask, past_key_values=None, **kwargs):
-    """Qwen2Attention.forward 的动态导出兼容版本 (2D 模式)。
+    """Qwen2Attention.forward 的动态导出兼容版本 (2D 模式 + prefix sharing)。
 
-    hidden_states: [T, hidden_size] (2D, 无 batch 维度)
+    hidden_states: [T_c, hidden_size] (2D, compact layout)
     所有 reshape 仅使用 Python int 常量 + -1, 不提取 SymInt, 消除 GE Pack 算子。
+
+    prefix sharing: expand_index/restore_index 由 ExportWrapper.forward 注入到 self。
+    - QKV 前 expand: compact [T_c] → expanded [T_e]
+    - attention 后 restore: expanded [T_e] → compact [T_c]
+    - o_proj 跑 compact, 省计算
     """
 
     num_heads = int(self.config.num_attention_heads)
     num_kv_heads = int(self.config.num_key_value_heads)
     hidden_size = int(self.config.hidden_size)
     head_dim = int(self.head_dim)
+
+    expand_index = getattr(self, 'expand_index', None)
+    if expand_index is not None:
+        hidden_states = torch.index_select(hidden_states, 0, expand_index)
 
     query_states = self.q_proj(hidden_states).reshape(-1, num_heads, head_dim)
     key_states = self.k_proj(hidden_states).reshape(-1, num_kv_heads, head_dim)
@@ -58,6 +68,10 @@ def _patched_attention_forward(self, hidden_states, position_embeddings,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling, sliding_window=self.sliding_window, **kwargs,
     )
+
+    restore_index = getattr(self, 'restore_index', None)
+    if restore_index is not None:
+        attn_output = torch.index_select(attn_output, 0, restore_index)
 
     attn_output = attn_output.reshape(-1, hidden_size).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -105,29 +119,30 @@ class ExportWrapper(nn.Module):
     核心设计: hidden_states 全程保持 2D [T, D], 不添加 batch 维度,
     避免 nn.Linear 内部 reshape back 产生 GE Pack 算子。
 
+    prefix sharing 模式 (prefix_len > 0):
+        input_ids 为 compact [prefix, req_1, ..., req_n], 省存储。
+        attention 内部 expand→QKV→Attn→restore, o_proj 跑 compact。
+
     动态输入 (forward 参数, 成为图 Data 节点):
-        input_ids:            [T] int64 — 所有 token 拼接 (T 动态)
-        position_ids:         [T] int64 — 对应 position ids (T 动态, 图中消除)
-        actual_seq_lengths:   [num_batch] int64 — 累积序列长度 (num_batch 动态)
-        cos:                  [1, T, 64] float16 — RoPE cos (T 动态)
-        sin:                  [1, T, 64] float16 — RoPE sin (T 动态)
-
-    固定输入 (module 属性, 成为图 Data 节点但 shape 固定):
-        atten_mask:            [2048, 2048] bool — 因果掩码 (固定)
-
-    图常量 (register_buffer, 不成为图输入):
-        FFN 权重 (_ffn_w1, _ffn_w2), 模型权重 (embeddings, q/k/v/o proj, lm_head)
+        input_ids:            [T_c] int64 — compact token ids (T_c 动态)
+        position_ids:         [T_e] int64 — expanded position ids (图中消除)
+        actual_seq_lengths:   [num_batch] int64 — expanded 累积序列长度
+        cos:                  [1, T_e, 64] float16 — RoPE cos (expanded)
+        sin:                  [1, T_e, 64] float16 — RoPE sin (expanded)
+        expand_index:         [T_e] int64 — compact→expanded 映射
+        restore_index:        [T_c] int64 — expanded→compact 映射
+        compact_last_indices: [num_batch] int64 — 每条序列最后 token 在 compact 中的位置
 
     输出:
         logits: [N, vocab_size] float16 — 仅每条序列最后一个 token 的 logits
-        N = num_batch (固定), 搜索相关性只需最后一个 token 做分类
     """
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids, position_ids, actual_seq_lengths, cos, sin):
+    def forward(self, input_ids, position_ids, actual_seq_lengths, cos, sin,
+                expand_index, restore_index, compact_last_indices):
         for layer in self.model.model.layers:
             layer.self_attn.actual_seq_lengths_tensor = actual_seq_lengths
         self.model.model.rotary_emb._cached_cos = cos
@@ -135,6 +150,11 @@ class ExportWrapper(nn.Module):
 
         m = self.model.model
         hidden = m.embed_tokens(input_ids)
+
+        for layer in m.layers:
+            layer.self_attn.expand_index = expand_index
+            layer.self_attn.restore_index = restore_index
+
         position_embeddings = m.rotary_emb(hidden, position_ids)
         for layer in m.layers:
             hidden = layer(
@@ -144,13 +164,12 @@ class ExportWrapper(nn.Module):
                 position_ids=position_ids,
                 use_cache=False,
             )
-        last_indices = actual_seq_lengths - 1
-        last_hidden = hidden.index_select(0, last_indices)
+        last_hidden = hidden.index_select(0, compact_last_indices)
         last_hidden = m.norm(last_hidden)
         return self.model.lm_head(last_hidden)
 
 
-def export_air(model_path, output_dir, device, batch_size, seq_len,
+def export_air(model_path, output_dir, device, batch_size, seq_len, prefix_len=0,
                export_name="qwen2.5-0.5b", prune=False, target_token_file=None):
     """导出 AIR 模型。
 
@@ -167,7 +186,8 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
         output_dir:        AIR 输出目录
         device:            NPU 设备号
         batch_size:        batch size
-        seq_len:           每条文本近似 token 数
+        seq_len:           每条文本 token 数 (含 prefix)
+        prefix_len:        共享前缀长度 (0 则不启用 prefix sharing)
         prune:             是否开启 lm_head vocab 剪裁
         target_token_file: target token JSON 文件路径 (prune=True 时必填)
     """
@@ -184,33 +204,55 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
         token_ids = load_target_tokens(target_token_file)
         prune_lm_head(model, token_ids)
 
-    # 3. 准备 varlen 输入 (全 0 token, 不需要 tokenizer)
-    concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
-        batch_size, seq_len
-    )
+    # 3. 准备 varlen 输入
+    if prefix_len > 0:
+        compact_ids, expanded_pos, seq_lens, cum_seq_lens = generate_compact_varlen_inputs(
+            batch_size, seq_len, prefix_len
+        )
+        t_expanded = cum_seq_lens[-1]
+        t_compact = prefix_len + batch_size * (seq_len - prefix_len)
+        print(f"  prefix sharing: prefix_len={prefix_len}, T_compact={t_compact}, T_expanded={t_expanded}")
+    else:
+        compact_ids, expanded_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
+            batch_size, seq_len
+        )
+        t_expanded = cum_seq_lens[-1]
+        t_compact = t_expanded
     setup_varlen_attention(model, cum_seq_lens, 'npu')
 
-    print(f"  batch_size={batch_size}, total_tokens={sum(seq_lens)}, "
+    print(f"  batch_size={batch_size}, T_expanded={t_expanded}, "
           f"seq_lens[:5]={seq_lens[:5]}, cum_seq_lens[-1]={cum_seq_lens[-1]}")
 
-    # 4. 构造 dummy 输入 (NPU 上, TND 格式)
-    input_ids = concat_ids.squeeze(0).npu()
-    position_ids = concat_pos.squeeze(0).npu()
+    # 4. 构造 dummy 输入 (NPU 上)
+    input_ids = compact_ids.squeeze(0).npu()
+    position_ids = expanded_pos.squeeze(0).npu()
     actual_seq_lengths = torch.tensor(cum_seq_lens, dtype=torch.int64, device='npu')
     cos = model.model.rotary_emb._cached_cos
     sin = model.model.rotary_emb._cached_sin
 
-    # 4.1 精确标记动态/静态维度
-    #    T (total tokens) 动态, N (序列数) 固定, D (head_dim) 固定
-    torch._dynamo.mark_dynamic(input_ids, 0)            # [T] → T 动态
-    torch._dynamo.mark_dynamic(position_ids, 0)         # [T] → T 动态
-    torch._dynamo.mark_dynamic(actual_seq_lengths, 0)   # [N] → N 动态 (batch size 可变)
-    torch._dynamo.mark_dynamic(cos, 1)                  # [1, T, 64] → T 动态
-    torch._dynamo.mark_dynamic(sin, 1)                  # [1, T, 64] → T 动态
-    torch._dynamo.mark_static(cos, 0)                   # [1, T, 64] → B=1 固定
-    torch._dynamo.mark_static(cos, 2)                   # [1, T, 64] → D=64 固定
-    torch._dynamo.mark_static(sin, 0)                   # [1, T, 64] → B=1 固定
-    torch._dynamo.mark_static(sin, 2)                   # [1, T, 64] → D=64 固定
+    # 4.1 prefix sharing indices
+    if prefix_len > 0:
+        expand_index = build_expand_index(prefix_len, seq_lens, 'npu')
+        restore_index = build_restore_index(prefix_len, seq_lens, 'npu')
+        compact_last_indices = build_compact_last_indices(prefix_len, seq_lens, 'npu')
+    else:
+        expand_index = torch.arange(t_expanded, dtype=torch.int64, device='npu')
+        restore_index = torch.arange(t_compact, dtype=torch.int64, device='npu')
+        compact_last_indices = actual_seq_lengths - 1
+
+    # 4.2 精确标记动态/静态维度
+    torch._dynamo.mark_dynamic(input_ids, 0)            # [T_c] → T_c 动态
+    torch._dynamo.mark_dynamic(position_ids, 0)         # [T_e] → T_e 动态 (图中消除)
+    torch._dynamo.mark_dynamic(actual_seq_lengths, 0)   # [N] → N 动态
+    torch._dynamo.mark_dynamic(cos, 1)                  # [1, T_e, 64] → T_e 动态
+    torch._dynamo.mark_dynamic(sin, 1)                  # [1, T_e, 64] → T_e 动态
+    torch._dynamo.mark_static(cos, 0)
+    torch._dynamo.mark_static(cos, 2)
+    torch._dynamo.mark_static(sin, 0)
+    torch._dynamo.mark_static(sin, 2)
+    torch._dynamo.mark_dynamic(expand_index, 0)         # [T_e] → T_e 动态
+    torch._dynamo.mark_dynamic(restore_index, 0)        # [T_c] → T_c 动态
+    torch._dynamo.mark_dynamic(compact_last_indices, 0) # [N] → N 动态
 
     # 5. 包装模型
     export_model = ExportWrapper(model)
@@ -223,12 +265,14 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"=== 导出 AIR (动态): {output_dir}/{export_name}.air ===")
-    print(f"  input_ids: {input_ids.shape}, position_ids: {position_ids.shape}")
-    print(f"  actual_seq_lengths: {actual_seq_lengths.shape}")
+    print(f"  input_ids: {input_ids.shape}, actual_seq_lengths: {actual_seq_lengths.shape}")
     print(f"  cos: {cos.shape}, sin: {sin.shape}")
+    print(f"  expand_index: {expand_index.shape}, restore_index: {restore_index.shape}")
+    print(f"  compact_last_indices: {compact_last_indices.shape}")
 
     dynamo_export(
         input_ids, position_ids, actual_seq_lengths, cos, sin,
+        expand_index, restore_index, compact_last_indices,
         model=export_model,
         export_path=output_dir,
         export_name=export_name,
@@ -274,7 +318,8 @@ def main():
     parser.add_argument("--om-dir", default=DEFAULT_OM_DIR, help="OM 输出目录")
     parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
     parser.add_argument("--batch-size", type=int, default=10, help="batch size")
-    parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数")
+    parser.add_argument("--seq-len", type=int, default=208, help="每条文本 token 数 (含 prefix)")
+    parser.add_argument("--prefix-len", type=int, default=0, help="共享前缀长度 (0 则不启用 prefix sharing)")
     parser.add_argument("--soc", default=DEFAULT_SOC, help="SoC 型号")
     parser.add_argument("--run-atc", action="store_true", help="自动执行 ATC 编译")
     parser.add_argument("--skip-export", action="store_true",
@@ -299,6 +344,7 @@ def main():
             args.device,
             args.batch_size,
             args.seq_len,
+            prefix_len=args.prefix_len,
             export_name=args.model_name,
             prune=args.prune_lm_head,
             target_token_file=args.target_token_file,

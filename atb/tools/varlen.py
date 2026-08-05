@@ -32,26 +32,32 @@ def generate_varlen_inputs(batch_size, seq_len):
     return concat_ids, concat_pos, seq_lens, cum_seq_lens
 
 
-def prepare_varlen_inputs(tokenizer, input_texts):
-    """将多条文本拼接为 varlen 格式的输入。
+def generate_compact_varlen_inputs(batch_size, seq_len, prefix_len):
+    """生成 prefix sharing 的 compact varlen 输入 (全 0 token, 不需要 tokenizer)。
+
+    compact layout: [prefix, req_0, req_1, ..., req_n]
+    每条 seq 包含 prefix, compact 中 prefix 只存一份。
+    T_compact = prefix_len + batch_size * (seq_len - prefix_len)
+
+    position_ids 仍是 expanded 格式 [0..S-1, 0..S-1, ...] (用于 cos/sin gather)。
 
     Returns:
-        concat_ids:  [1, total_len] 拼接后的 token ids
-        concat_pos:  [1, total_len] 拼接后的 position ids
-        seq_lens:    list[int] 每条文本的长度
-        cum_seq_lens: list[int] 累积长度 (用于 actual_seq_lengths)
+        compact_ids:  [1, T_compact] 全 0 token ids
+        expanded_pos: [1, T_expanded] 拼接后的 position ids (expanded)
+        seq_lens:     list[int] 每条序列的长度 (含 prefix)
+        cum_seq_lens: list[int] 累积长度 (expanded, 用于 actual_seq_lengths)
     """
-    all_ids, pos_ids = [], []
-    for text in input_texts:
-        ids = tokenizer(text, return_tensors="pt")["input_ids"][0]
-        all_ids.append(ids)
-        pos_ids.append(torch.arange(ids.shape[0]))
-    seq_lens = [x.shape[0] for x in all_ids]
-    concat_ids = torch.cat(all_ids).unsqueeze(0)
-    concat_pos = torch.cat(pos_ids).unsqueeze(0)
+    seq_lens = [seq_len] * batch_size
+    req_tokens = seq_len - prefix_len
+    total_compact = prefix_len + batch_size * req_tokens
+    compact_ids = torch.zeros(total_compact, dtype=torch.long).unsqueeze(0)
+
+    pos_ids = [torch.arange(seq_len) for _ in range(batch_size)]
+    expanded_pos = torch.cat(pos_ids).unsqueeze(0)
+
     cum_seq_lens = []
     acc = 0
     for s in seq_lens:
         acc += s
         cum_seq_lens.append(acc)
-    return concat_ids, concat_pos, seq_lens, cum_seq_lens
+    return compact_ids, expanded_pos, seq_lens, cum_seq_lens
