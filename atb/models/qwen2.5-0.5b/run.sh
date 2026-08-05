@@ -18,6 +18,7 @@
 #   --requests N      bench 请求数 (默认 100)
 #   --threads N       bench 线程数 (默认 1)
 #   --prune           开启 lm_head vocab 剪裁
+#   --fixed-seq <len> 固定序列长度 (默认随机)
 #   --profiling       开启 profiling (infer/bench 生效)
 #   --debug           ATC 编译开启 --log=debug
 #   --dump            ATC 编译开启 GE 图 dump
@@ -52,6 +53,7 @@ WARMUP=10
 REQUESTS=100
 THREADS=1
 PRUNE=false
+FIXED_SEQ=""
 PROFILING=false
 DEBUG=false
 DUMP=false
@@ -87,6 +89,7 @@ Options:
   --requests N      Benchmark requests (default: 100)
   --threads N       Benchmark threads (default: 1)
   --prune           Enable lm_head vocab pruning
+  --fixed-seq <len> Fixed sequence length (default: random)
   --profiling       Enable profiling
   --debug           ATC --log=debug
   --dump            ATC GE graph dump
@@ -113,6 +116,7 @@ parse_common_args() {
             --requests)   REQUESTS="$2"; shift 2 ;;
             --threads)    THREADS="$2"; shift 2 ;;
             --prune)      PRUNE=true; shift ;;
+            --fixed-seq)  FIXED_SEQ="$2"; shift 2 ;;
             --profiling)  PROFILING=true; shift ;;
             --debug)      DEBUG=true; shift ;;
             --dump)       DUMP=true; shift ;;
@@ -231,13 +235,16 @@ do_bench() {
         log_info "Profiling output: ${PROFILING_DIR}"
     fi
 
+    local fixed_seq_flag=""
+    [ -n "$FIXED_SEQ" ] && fixed_seq_flag="--fixed-seq ${FIXED_SEQ}"
+
     cd "${ATB_DIR}"
     run_or_echo "./build/bench_latency \
         --model ${om_file} \
         --threads ${THREADS} \
         --requests ${REQUESTS} \
         --warmup ${WARMUP} \
-        --device-id ${DEVICE} ${profiling_args}"
+        --device-id ${DEVICE} ${fixed_seq_flag} ${profiling_args}"
 }
 
 # =============================================================================
