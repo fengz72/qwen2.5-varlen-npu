@@ -24,6 +24,7 @@ cos/sin 预计算策略:
 """
 
 import argparse
+import json
 import os
 import torch
 import torch_npu
@@ -32,10 +33,12 @@ from .varlen_utils import setup_varlen_attention, precompute_rope_cos_sin
 from .varlen_utils import build_expand_index, build_restore_index, build_compact_last_indices
 from .export_air import load_model, ExportWrapper
 from atb.tools.varlen import generate_compact_varlen_inputs, generate_varlen_inputs
+from atb.tools.lm_head_prune import load_target_tokens, prune_lm_head
 
 _MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL_PATH = "/export/home/models/Qwen2.5-0.5B"
 DEFAULT_OUTPUT_DIR = os.path.join(_MODEL_DIR, "input_data")
+DEFAULT_TARGET_TOKEN_FILE = os.path.join(_MODEL_DIR, "target_tokens.json")
 DEFAULT_DEVICE = 0
 
 BATCH_SIZE = 10
@@ -50,12 +53,24 @@ def main():
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录")
     parser.add_argument("--device", type=int, default=DEFAULT_DEVICE, help="NPU 设备号")
     parser.add_argument("--prefix-len", type=int, default=PREFIX_LEN, help="共享前缀长度 (0 则不启用)")
+    parser.add_argument("--prune-lm-head", action="store_true",
+                        help="开启 lm_head vocab 剪裁 (与 export_air.py --prune-lm-head 一致)")
+    parser.add_argument("--target-token-file", default=DEFAULT_TARGET_TOKEN_FILE,
+                        help=f'target token JSON 文件 (默认: {DEFAULT_TARGET_TOKEN_FILE})')
     args = parser.parse_args()
 
     prefix_len = args.prefix_len
 
     # 1. 加载模型 (与 export 完全一致)
     model = load_model(args.model_path, args.device)
+
+    # 1.1 lm_head vocab 剪裁 (与 export_air.py 一致)
+    token_ids = None
+    if args.prune_lm_head:
+        if not args.target_token_file or not os.path.exists(args.target_token_file):
+            raise FileNotFoundError(f"target_token_file 不存在: {args.target_token_file}")
+        token_ids = load_target_tokens(args.target_token_file)
+        prune_lm_head(model, token_ids)
 
     # 2. 准备 varlen 输入
     if prefix_len > 0:
@@ -152,6 +167,20 @@ def main():
     golden_path = os.path.join(args.output_dir, "golden_logits.bin")
     golden_logits.detach().numpy().tofile(golden_path)
     print(f"Golden logits saved to: {golden_path}")
+
+    # 8. 保存 vocab map (prune 模式下, 与 export_air.py 一致)
+    if token_ids:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        token_names = [tokenizer.decode([tid]) for tid in token_ids]
+        map_path = os.path.join(args.output_dir, "golden_vocab_map.json")
+        with open(map_path, "w") as f:
+            json.dump({
+                "original_token_ids": token_ids,
+                "token_names": token_names,
+                "pruned_vocab_size": len(token_ids),
+            }, f, indent=2, ensure_ascii=False)
+        print(f"Vocab map saved to: {map_path}")
 
 
 if __name__ == "__main__":
