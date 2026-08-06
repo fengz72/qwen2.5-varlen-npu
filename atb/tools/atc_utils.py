@@ -9,7 +9,7 @@ import subprocess
 import numpy
 
 
-def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
+def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False, aicore_num=None):
     """执行 ATC 命令将 AIR 编译为 OM。
 
     --framework=1 表示输入为 AIR 格式 (GE 原生图格式)。
@@ -17,6 +17,10 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
     使用自定义 Pass (NzWeightPass) 在 Const→MatMul 间插入 TransData,
     利用常量折叠在编译期完成大权重 ND→FRACTAL_NZ 转换, 消除运行时 TransData。
     NzWeightPass 已安装到 CANN opp/vendors/custom_nz_pass/custom_fusion_passes/。
+
+    aicore_num: None 时不传 (ATC 默认全核);
+                传入单个整数 N 时视为 AIC 核数, AIV=N*2 (c:v=1:2, 如 12→12|24);
+                传入 "aic|aiv" 格式字符串时原样透传。
     """
     os.makedirs(om_dir, exist_ok=True)
     air_basename = os.path.splitext(os.path.basename(air_path))[0]
@@ -33,6 +37,16 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False):
 
     if is_debug:
         cmd += f' --log=debug'
+
+    if aicore_num is not None:
+        aicore_str = str(aicore_num)
+        if aicore_str.isdigit():
+            total = int(aicore_str)
+            aic = total
+            aiv = aic * 2
+            cmd += f' --aicore_num="{aic}|{aiv}"'
+        else:
+            cmd += f' --aicore_num="{aicore_str}"'
 
     print(f"=== 执行 ATC 编译 ===")
     print(f"  命令: {cmd}\n")

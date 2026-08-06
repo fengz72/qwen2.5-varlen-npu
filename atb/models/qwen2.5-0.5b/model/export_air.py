@@ -325,6 +325,9 @@ def main():
     parser.add_argument("--skip-export", action="store_true",
                         help="跳过导出, 直接用已有 AIR 做 ATC 编译")
     parser.add_argument("--debug", action="store_true", help="ATC 编译时开启 --log=debug")
+    parser.add_argument("--aicore-num", default=None,
+                        help="ATC 编译核数: 传单个整数 N 视为 AIC 核数, AIV=N*2 (如 12→12|24); "
+                             "传 'aic|aiv' 原样透传; 不传则默认全核")
     parser.add_argument("--prune-lm-head", action="store_true",
                         help="开启 lm_head vocab 剪裁")
     parser.add_argument("--target-token-file", default=DEFAULT_TARGET_TOKEN_FILE,
@@ -352,7 +355,7 @@ def main():
 
     if args.run_atc:
         om_path = run_atc(air_path, args.om_dir, args.soc,
-                          is_debug=args.debug)
+                          is_debug=args.debug, aicore_num=args.aicore_num)
         if om_path:
             print(f"=== 全流程完成 ===")
             print(f"  AIR: {air_path}")

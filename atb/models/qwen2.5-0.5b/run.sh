@@ -23,6 +23,7 @@
 #   --profiling       开启 profiling (infer/bench 生效)
 #   --debug           ATC 编译开启 --log=debug
 #   --dump            ATC 编译开启 GE 图 dump
+#   --aicore-num N    ATC 编译核数 (整数 N 按 1:2 拆分, 或 'aic|aiv'; 不传默认全核)
 #   --dry-run         只打印命令不执行
 #   -h, --help        显示帮助
 #
@@ -60,6 +61,7 @@ PROFILING=false
 DEBUG=false
 DUMP=false
 DRY_RUN=false
+AICORE_NUM=""
 
 # ---- 颜色输出 ----
 RED='\033[0;31m'
@@ -96,6 +98,7 @@ Options:
   --profiling       Enable profiling
   --debug           ATC --log=debug
   --dump            ATC GE graph dump
+  --aicore-num N    ATC aicore num (int N splits 1:2, or 'aic|aiv'; default: full)
   --dry-run         Print commands without executing
   -h, --help        Show help
 
@@ -124,6 +127,7 @@ parse_common_args() {
             --profiling)  PROFILING=true; shift ;;
             --debug)      DEBUG=true; shift ;;
             --dump)       DUMP=true; shift ;;
+            --aicore-num) AICORE_NUM="$2"; shift 2 ;;
             --dry-run)    DRY_RUN=true; shift ;;
             -h|--help)    usage; exit 0 ;;
             *)            log_error "Unknown option: $1"; usage; exit 1 ;;
@@ -184,6 +188,8 @@ do_atc() {
     fi
     local debug_flag=""
     [ "$DEBUG" = true ] && debug_flag="--debug"
+    local aicore_flag=""
+    [ -n "$AICORE_NUM" ] && aicore_flag="--aicore-num ${AICORE_NUM}"
     local dump_env=""
     if [ "$DUMP" = true ]; then
         local dump_dir="${MODEL_DIR}/dump_graph"
@@ -199,7 +205,7 @@ do_atc() {
         --om-dir ${OM_DIR} \
         --model-name ${MODEL_NAME} \
         --soc ${SOC} \
-        --prefix-len ${PREFIX_LEN} ${debug_flag}"
+        --prefix-len ${PREFIX_LEN} ${debug_flag} ${aicore_flag}"
 }
 
 # =============================================================================
