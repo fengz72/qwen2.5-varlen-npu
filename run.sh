@@ -9,6 +9,8 @@ bash build.sh
 
 cd "$(dirname "$0")/models/qwen2.5-0.5b"
 
+PYTHONPATH=../../..:.. python3 -m model.prepare_air_inputs --device 8 --prune-lm-head
+
 ./run.sh pass
 ./run.sh export --prune
 ./run.sh atc
