@@ -17,6 +17,7 @@
 #   --warmup N        预热次数 (默认 10)
 #   --requests N      bench 请求数 (默认 100)
 #   --threads N       bench 线程数 (默认 1)
+#   --sweep <list>    bench 串行扫描线程数, 逗号分隔 (如 1,2,4,8; 与 --threads 互斥)
 #   --prune           开启 lm_head vocab 剪裁
 #   --fixed-seq <len> 固定序列长度 (默认随机)
 #   --profiling       开启 profiling (infer/bench 生效)
@@ -53,6 +54,7 @@ SOC="Ascend910_9382"
 WARMUP=10
 REQUESTS=100
 THREADS=1
+SWEEP=""
 PRUNE=false
 FIXED_SEQ=""
 PROFILING=false
@@ -90,6 +92,7 @@ Options:
   --warmup N        Warmup runs (default: 10)
   --requests N      Benchmark requests (default: 100)
   --threads N       Benchmark threads (default: 1)
+  --sweep <list>    Comma-separated thread counts (e.g. 1,2,4,8; overrides --threads)
   --prune           Enable lm_head vocab pruning
   --fixed-seq <len> Fixed sequence length (default: random)
   --profiling       Enable profiling
@@ -103,6 +106,7 @@ Examples:
   ./run.sh all --profiling
   ./run.sh pass && ./run.sh atc && ./run.sh bench --profiling
   ./run.sh bench --warmup 10 --requests 100 && ./run.sh parse
+  ./run.sh bench --sweep 1,2,4,8 --requests 100 --warmup 50
   ./run.sh export --prune
 EOF
 }
@@ -118,6 +122,7 @@ parse_common_args() {
             --warmup)     WARMUP="$2"; shift 2 ;;
             --requests)   REQUESTS="$2"; shift 2 ;;
             --threads)    THREADS="$2"; shift 2 ;;
+            --sweep)      SWEEP="$2"; shift 2 ;;
             --prune)      PRUNE=true; shift ;;
             --fixed-seq)  FIXED_SEQ="$2"; shift 2 ;;
             --profiling)  PROFILING=true; shift ;;
@@ -244,10 +249,13 @@ do_bench() {
     local fixed_seq_flag=""
     [ -n "$FIXED_SEQ" ] && fixed_seq_flag="--fixed-seq ${FIXED_SEQ}"
 
+    local thread_arg="--threads ${THREADS}"
+    [ -n "$SWEEP" ] && thread_arg="--sweep ${SWEEP}"
+
     cd "${ATB_DIR}"
     run_or_echo "./build/bench_latency \
         --model ${om_file} \
-        --threads ${THREADS} \
+        ${thread_arg} \
         --requests ${REQUESTS} \
         --warmup ${WARMUP} \
         --device-id ${DEVICE} ${fixed_seq_flag} ${profiling_args}"
