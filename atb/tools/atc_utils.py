@@ -21,10 +21,25 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False, aicore_num=
     aicore_num: None 时不传 (ATC 默认全核);
                 传入单个整数 N 时视为 AIC 核数, AIV=N*2 (c:v=1:2, 如 12→12|24);
                 传入 "aic|aiv" 格式字符串时原样透传。
+    aicore_num 非空时, OM 文件名加 _c{aic}_{aiv} 后缀, 避免不同配置互相覆盖。
     """
     os.makedirs(om_dir, exist_ok=True)
     air_basename = os.path.splitext(os.path.basename(air_path))[0]
-    om_output = os.path.join(om_dir, air_basename)
+
+    name_suffix = ""
+    if aicore_num is not None:
+        aicore_str = str(aicore_num)
+        if aicore_str.isdigit():
+            aic = int(aicore_str)
+            aiv = aic * 2
+            aicore_str = f"{aic}|{aiv}"
+        else:
+            parts = aicore_str.split("|")
+            aic = parts[0]
+            aiv = parts[1] if len(parts) > 1 else aic
+        name_suffix = f"_c{aic}_{aiv}"
+
+    om_output = os.path.join(om_dir, air_basename + name_suffix)
 
     cmd = (
         f"atc --framework=1"
@@ -39,14 +54,7 @@ def run_atc(air_path, om_dir, soc, input_shape=None, is_debug=False, aicore_num=
         cmd += f' --log=debug'
 
     if aicore_num is not None:
-        aicore_str = str(aicore_num)
-        if aicore_str.isdigit():
-            total = int(aicore_str)
-            aic = total
-            aiv = aic * 2
-            cmd += f' --aicore_num="{aic}|{aiv}"'
-        else:
-            cmd += f' --aicore_num="{aicore_str}"'
+        cmd += f' --aicore_num="{aicore_str}"'
 
     print(f"=== 执行 ATC 编译 ===")
     print(f"  命令: {cmd}\n")

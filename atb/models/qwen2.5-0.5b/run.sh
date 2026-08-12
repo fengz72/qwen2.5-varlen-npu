@@ -189,7 +189,7 @@ do_atc() {
     local debug_flag=""
     [ "$DEBUG" = true ] && debug_flag="--debug"
     local aicore_flag=""
-    [ -n "$AICORE_NUM" ] && aicore_flag="--aicore-num ${AICORE_NUM}"
+    [ -n "$AICORE_NUM" ] && aicore_flag="--aicore-num '${AICORE_NUM}'"
     local dump_env=""
     if [ "$DUMP" = true ]; then
         local dump_dir="${MODEL_DIR}/dump_graph"
@@ -226,11 +226,28 @@ do_infer() {
 do_bench() {
     log_step "Step 5: Latency benchmark (bench_latency)"
 
-    # 查找 OM 文件
+    # 查找 OM 文件: 有 --aicore-num 时按后缀匹配, 否则用默认名
     local om_file
-    om_file="${OM_DIR}/${MODEL_NAME}_linux_aarch64.om"
+    if [ -n "$AICORE_NUM" ]; then
+        local aic aiv
+        if [[ "$AICORE_NUM" == *"|"* ]]; then
+            aic="${AICORE_NUM%%|*}"
+            aiv="${AICORE_NUM##*|}"
+        else
+            aic="$AICORE_NUM"
+            aiv=$((aic * 2))
+        fi
+        om_file="${OM_DIR}/${MODEL_NAME}_c${aic}_${aiv}_linux_aarch64.om"
+    else
+        om_file="${OM_DIR}/${MODEL_NAME}_linux_aarch64.om"
+    fi
     if [ ! -f "$om_file" ]; then
-        om_file=$(find "${OM_DIR}" -name "${MODEL_NAME}*.om" -type f 2>/dev/null | head -1)
+        if [ -n "$AICORE_NUM" ]; then
+            log_error "OM not found: ${om_file}, run './run.sh atc --aicore-num ${AICORE_NUM}' first"
+            exit 1
+        else
+            om_file=$(find "${OM_DIR}" -name "${MODEL_NAME}*.om" -type f 2>/dev/null | head -1)
+        fi
     fi
     if [ ! -f "$om_file" ]; then
         log_error "OM not found in ${OM_DIR}, run './run.sh atc' first"

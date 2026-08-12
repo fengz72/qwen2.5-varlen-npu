@@ -18,6 +18,6 @@ PYTHONPATH=../../..:.. python3 -m model.prepare_air_inputs --device 8 --prune-lm
 
 ./run.sh pass # 编译安装pass
 ./run.sh export --prune # 导出air
-./run.sh atc # 导出om
-./run.sh bench --threads 3 --warmup 20 --requests 100 --device 8
+./run.sh atc --aicore "12|24" # 导出om
+./run.sh bench --threads 3 --warmup 20 --requests 100 --device 8 --aicore "12|24"
 # ./run.sh parse
