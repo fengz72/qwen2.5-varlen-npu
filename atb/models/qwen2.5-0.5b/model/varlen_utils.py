@@ -9,18 +9,14 @@ import torch
 from .attention import build_causal_mask_2048
 
 
-def precompute_rope_cos_sin(model, total_len, device):
-    """图外预计算 RoPE 的 cos/sin, 直接生成 fp16, 避免图内 Cast kernel。
+def precompute_rope_cos_sin(model, max_seq_len, device):
+    """预计算 RoPE cos/sin 表并注册为 buffer, 配合 frozen_parameter 成为图常量。
 
-    Qwen2RotaryEmbedding.forward 原始计算:
-        inv_freq @ position_ids (fp32) → cat → cos → sin → Cast(fp32→fp16)
-    其中 Cast 在 profiling 中耗时 206us。
-
-    图外预计算后, cos/sin 作为 fp16 tensor 注入, 图内不再有 Cast/MatMul/Cos/Sin。
-    直接内联计算, 不依赖 rotary_emb.forward (可能已被 monkey-patch)。
+    cos/sin 表 [1, max_seq_len, 64] 作为 register_buffer 注册,
+    图内 _npu_rotary_emb_forward 按 position_ids gather 出 [1, T, 64]。
     """
     rotary_emb = model.model.rotary_emb
-    position_ids = torch.arange(total_len, dtype=torch.long, device=device).unsqueeze(0)
+    position_ids = torch.arange(max_seq_len, dtype=torch.long, device=device).unsqueeze(0)
 
     inv_freq = rotary_emb.inv_freq
     scaling = rotary_emb.attention_scaling
@@ -32,15 +28,15 @@ def precompute_rope_cos_sin(model, total_len, device):
     cos = (emb.cos() * scaling).to(dtype=torch.float16)
     sin = (emb.sin() * scaling).to(dtype=torch.float16)
 
-    rotary_emb._cached_cos = cos
-    rotary_emb._cached_sin = sin
+    rotary_emb.register_buffer('_cos_table', cos, persistent=False)
+    rotary_emb.register_buffer('_sin_table', sin, persistent=False)
 
 
-def setup_varlen_attention(model, cum_seq_lens, device):
+def setup_varlen_attention(model, cum_seq_lens, device, max_seq_len=1024):
     """向模型每一层注入 varlen attention 所需的 actual_seq_lengths 和 mask。
 
     同时禁用 transformers 自带的 _update_causal_mask (由推理算子内部处理)。
-    预计算 RoPE cos/sin 并注入, 避免图内 Cast。
+    预计算 RoPE cos/sin 表并注册为 buffer (图常量)。
 
     Returns:
         atten_mask: 构建的因果掩码张量
@@ -52,8 +48,6 @@ def setup_varlen_attention(model, cum_seq_lens, device):
         layer.self_attn.register_buffer('atten_mask', atten_mask)
     model.model._update_causal_mask = lambda *a, **kw: None
 
-    # 图外预计算 cos/sin
-    total_len = cum_seq_lens[-1] if cum_seq_lens else 0
-    precompute_rope_cos_sin(model, total_len, device)
+    precompute_rope_cos_sin(model, max_seq_len, device)
 
     return atten_mask

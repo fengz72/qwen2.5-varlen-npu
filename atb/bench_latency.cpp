@@ -97,8 +97,6 @@ static ProfilingConfig ParseProfilingConfig(int argc, char* argv[])
     } while (0)
 
 static const int    VOCAB_SIZE         = 151936;
-static const int    HEAD_DIM           = 64;
-static const double ROPE_BASE          = 1000000.0;
 static const int    MAX_BATCH_SIZE     = 11;
 static const int    MAX_SEQ_LEN        = 218;
 static const int    MAX_TOTAL_TOKENS   = MAX_BATCH_SIZE * MAX_SEQ_LEN;
@@ -125,78 +123,6 @@ static inline double elapsed_ms(TimePoint start, TimePoint end) {
 }
 
 // ============================================================================
-// Cos/Sin table (precomputed on host)
-// ============================================================================
-
-struct CosSinTable {
-    std::vector<float> inv_freq;
-    std::vector<float> cos_table;
-    std::vector<float> sin_table;
-    int max_len;
-    int dim;
-
-    static uint16_t float_to_fp16(float f) {
-        uint32_t x = *reinterpret_cast<uint32_t*>(&f);
-        uint16_t h;
-        uint32_t sign = (x >> 31) & 0x1;
-        int32_t  exp  = (x >> 23) & 0xFF;
-        uint32_t frac = x & 0x7FFFFF;
-        if (exp == 0xFF) {
-            h = (sign << 15) | 0x7C00 | (frac ? 0x200 : 0);
-        } else if (exp >= 142) {
-            h = (sign << 15) | 0x7C00;
-        } else if (exp >= 113) {
-            h = (sign << 15) | ((exp - 112) << 10) | (frac >> 13);
-        } else if (exp >= 103) {
-            int shift = 113 - exp;
-            h = (sign << 15) | (frac >> (shift + 13));
-            if ((frac >> (shift + 12)) & 1) h++;
-        } else {
-            h = (sign << 15);
-        }
-        return h;
-    }
-
-    void init(int max_seq_len, int head_dim = HEAD_DIM, double base = ROPE_BASE) {
-        max_len = max_seq_len;
-        dim = head_dim;
-        int half = dim / 2;
-        inv_freq.resize(half);
-        for (int i = 0; i < half; i++) {
-            inv_freq[i] = 1.0f / std::pow(base, (2.0 * i) / dim);
-        }
-        cos_table.resize(max_len * dim);
-        sin_table.resize(max_len * dim);
-        for (int pos = 0; pos < max_len; pos++) {
-            for (int j = 0; j < half; j++) {
-                float freq = pos * inv_freq[j];
-                cos_table[pos * dim + j]         = std::cos(freq);
-                cos_table[pos * dim + j + half]  = std::cos(freq);
-                sin_table[pos * dim + j]         = std::sin(freq);
-                sin_table[pos * dim + j + half]  = std::sin(freq);
-            }
-        }
-    }
-
-    void gather(const std::vector<int64_t>& pos_ids,
-                std::vector<uint16_t>& cos_out,
-                std::vector<uint16_t>& sin_out) const {
-        int t = pos_ids.size();
-        cos_out.resize(t * dim);
-        sin_out.resize(t * dim);
-        for (int i = 0; i < t; i++) {
-            int p = pos_ids[i];
-            for (int d = 0; d < dim; d++) {
-                float c = cos_table[p * dim + d];
-                float s = sin_table[p * dim + d];
-                cos_out[i * dim + d] = float_to_fp16(c);
-                sin_out[i * dim + d] = float_to_fp16(s);
-            }
-        }
-    }
-};
-
-// ============================================================================
 // Request with per-stage timing
 // ============================================================================
 
@@ -204,8 +130,7 @@ struct Request {
     int req_id;
     std::vector<int64_t> input_ids;
     std::vector<int64_t> actual_seq_lengths;
-    std::vector<uint16_t> cos_data;
-    std::vector<uint16_t> sin_data;
+    std::vector<int64_t> position_ids;
     int total_tokens;
     int batch_size;
 
@@ -220,8 +145,8 @@ struct Request {
 // Random request generator matching production distributions
 class RequestGenerator {
 public:
-    RequestGenerator(unsigned seed, const CosSinTable& table)
-        : rng_(seed), table_(table),
+    RequestGenerator(unsigned seed)
+        : rng_(seed),
           batch_dist_(BATCH_AVG, BATCH_STD),
           seq_log_dist_(SEQ_LOG_MEAN, SEQ_LOG_STD) {}
 
@@ -270,15 +195,13 @@ public:
                 pos_ids[idx++] = p;
             }
         }
-
-        table_.gather(pos_ids, req.cos_data, req.sin_data);
+        req.position_ids = std::move(pos_ids);
 
         return req;
     }
 
 private:
     std::mt19937 rng_;
-    const CosSinTable& table_;
     std::normal_distribution<double> batch_dist_;
     std::normal_distribution<double> seq_log_dist_;
 };
@@ -424,8 +347,7 @@ public:
           output_buffer(nullptr), output_max_bytes(0) {
         input_specs = {
             {ACL_INT64,   {MAX_BATCH_SIZE},                    (size_t)MAX_BATCH_SIZE * 8},
-            {ACL_FLOAT16, {1, MAX_TOTAL_TOKENS, HEAD_DIM},     (size_t)1 * MAX_TOTAL_TOKENS * HEAD_DIM * 2},
-            {ACL_FLOAT16, {1, MAX_TOTAL_TOKENS, HEAD_DIM},     (size_t)1 * MAX_TOTAL_TOKENS * HEAD_DIM * 2},
+            {ACL_INT64,   {MAX_TOTAL_TOKENS},                  (size_t)MAX_TOTAL_TOKENS * 8},
             {ACL_INT64,   {MAX_TOTAL_TOKENS},                  (size_t)MAX_TOTAL_TOKENS * 8},
         };
         output_max_bytes = (size_t)MAX_BATCH_SIZE * VOCAB_SIZE * 2;
@@ -479,18 +401,16 @@ public:
             std::vector<int64_t> shape;
         };
 
-        InputData inputs[4] = {
+        InputData inputs[3] = {
             {req.actual_seq_lengths.data(), req.actual_seq_lengths.size() * 8, ACL_INT64,
              {static_cast<int64_t>(req.actual_seq_lengths.size())}},
-            {req.cos_data.data(), req.cos_data.size() * 2, ACL_FLOAT16,
-             {1, static_cast<int64_t>(req.total_tokens), HEAD_DIM}},
-            {req.sin_data.data(), req.sin_data.size() * 2, ACL_FLOAT16,
-             {1, static_cast<int64_t>(req.total_tokens), HEAD_DIM}},
+            {req.position_ids.data(), req.position_ids.size() * 8, ACL_INT64,
+             {static_cast<int64_t>(req.total_tokens)}},
             {req.input_ids.data(), req.input_ids.size() * 8, ACL_INT64,
              {static_cast<int64_t>(req.total_tokens)}},
         };
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             if (inputs[i].bytes > input_max_sizes[i]) {
                 std::cerr << "[ERROR] Input " << i << " size " << inputs[i].bytes
                           << " > buffer " << input_max_sizes[i] << std::endl;
@@ -582,7 +502,7 @@ struct BenchResult {
 
 static int run_benchmark(const std::string& model_path,
                          int num_threads, int total_requests, int warmup,
-                         const CosSinTable& cos_sin_table, int device_id,
+                         int device_id,
                          aclrtContext acl_ctx,
                          BenchResult& result) {
     int requests_per_thread = (total_requests + num_threads - 1) / num_threads;
@@ -614,7 +534,7 @@ static int run_benchmark(const std::string& model_path,
     // Warmup (single thread, sequential)
     if (warmup > 0) {
         std::cout << "[INFO] Warmup (" << warmup << " requests)..." << std::endl;
-        RequestGenerator gen(0, cos_sin_table);
+        RequestGenerator gen(0);
         for (int i = 0; i < warmup; i++) {
             Request req = gen.generate(i, Clock::now());
             int r = threads_ctx[0]->set_inputs(req);
@@ -638,7 +558,7 @@ static int run_benchmark(const std::string& model_path,
         workers.emplace_back([&, t]() {
             aclrtSetCurrentContext(acl_ctx);
             StreamContext* ctx = threads_ctx[t].get();
-            RequestGenerator gen(42 + t * 1000, cos_sin_table);
+            RequestGenerator gen(42 + t * 1000);
 
             for (int i = 0; i < requests_per_thread; i++) {
                 int req_id = t * requests_per_thread + i;
@@ -870,17 +790,12 @@ int main(int argc, char* argv[]) {
     ret = aclrtCreateContext(&acl_ctx, device_id);
     ACL_CHECK(ret, "create_context");
 
-    // Precompute cos/sin table
-    CosSinTable cos_sin_table;
-    cos_sin_table.init(MAX_SEQ_LEN);
-    std::cout << "[INFO] Cos/sin table: [" << MAX_SEQ_LEN << ", " << HEAD_DIM << "]" << std::endl;
-
     // Run benchmarks
     std::vector<BenchResult> results;
     for (int n : thread_counts) {
         BenchResult r;
         ret = run_benchmark(model_path, n, total_requests, warmup,
-                            cos_sin_table, device_id, acl_ctx, r);
+                            device_id, acl_ctx, r);
         if (ret != ACL_SUCCESS) {
             std::cerr << "[ERROR] Benchmark failed for threads=" << n << std::endl;
             break;

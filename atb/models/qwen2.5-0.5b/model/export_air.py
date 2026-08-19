@@ -107,16 +107,14 @@ class ExportWrapper(nn.Module):
 
     动态输入 (forward 参数, 成为图 Data 节点):
         input_ids:            [T] int64 — 所有 token 拼接 (T 动态)
-        position_ids:         [T] int64 — 对应 position ids (T 动态, 图中消除)
+        position_ids:         [T] int64 — 对应 position ids (T 动态, 用于 cos/sin Gather)
         actual_seq_lengths:   [num_batch] int64 — 累积序列长度 (num_batch 动态)
-        cos:                  [1, T, 64] float16 — RoPE cos (T 动态)
-        sin:                  [1, T, 64] float16 — RoPE sin (T 动态)
 
     固定输入 (module 属性, 成为图 Data 节点但 shape 固定):
         atten_mask:            [2048, 2048] bool — 因果掩码 (固定)
 
     图常量 (register_buffer, 不成为图输入):
-        FFN 权重 (_ffn_w1, _ffn_w2), 模型权重 (embeddings, q/k/v/o proj, lm_head)
+        RoPE cos/sin 表 [1, 1024, 64] (frozen_parameter), FFN 权重, 模型权重
 
     输出:
         logits: [N, vocab_size] float16 — 仅每条序列最后一个 token 的 logits
@@ -127,11 +125,9 @@ class ExportWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids, position_ids, actual_seq_lengths, cos, sin):
+    def forward(self, input_ids, position_ids, actual_seq_lengths):
         for layer in self.model.model.layers:
             layer.self_attn.actual_seq_lengths_tensor = actual_seq_lengths
-        self.model.model.rotary_emb._cached_cos = cos
-        self.model.model.rotary_emb._cached_sin = sin
 
         m = self.model.model
         hidden = m.embed_tokens(input_ids)
@@ -158,7 +154,7 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
       1. 加载模型 (NPU, npu_fia, fp16) — 与 graph_fused 推理模式一致
       2. 应用融合算子 (RMSNorm + RoPE)
       2.1 lm_head vocab 剪裁 (可选)
-      3. 设置 varlen 参数 (actual_seq_lengths, atten_mask, cos/sin 预计算)
+      3. 设置 varlen 参数 (actual_seq_lengths, atten_mask, cos/sin 表注册为 buffer)
       4. 包装模型 (ExportWrapper, 只返回 logits)
       5. dynamo_export 导出 AIR (动态 shape)
 
@@ -197,20 +193,12 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
     input_ids = concat_ids.squeeze(0).npu()
     position_ids = concat_pos.squeeze(0).npu()
     actual_seq_lengths = torch.tensor(cum_seq_lens, dtype=torch.int64, device='npu')
-    cos = model.model.rotary_emb._cached_cos
-    sin = model.model.rotary_emb._cached_sin
 
     # 4.1 精确标记动态/静态维度
-    #    T (total tokens) 动态, N (序列数) 固定, D (head_dim) 固定
+    #    T (total tokens) 动态, N (序列数) 固定
     torch._dynamo.mark_dynamic(input_ids, 0)            # [T] → T 动态
     torch._dynamo.mark_dynamic(position_ids, 0)         # [T] → T 动态
     torch._dynamo.mark_dynamic(actual_seq_lengths, 0)   # [N] → N 动态 (batch size 可变)
-    torch._dynamo.mark_dynamic(cos, 1)                  # [1, T, 64] → T 动态
-    torch._dynamo.mark_dynamic(sin, 1)                  # [1, T, 64] → T 动态
-    torch._dynamo.mark_static(cos, 0)                   # [1, T, 64] → B=1 固定
-    torch._dynamo.mark_static(cos, 2)                   # [1, T, 64] → D=64 固定
-    torch._dynamo.mark_static(sin, 0)                   # [1, T, 64] → B=1 固定
-    torch._dynamo.mark_static(sin, 2)                   # [1, T, 64] → D=64 固定
 
     # 5. 包装模型
     export_model = ExportWrapper(model)
@@ -225,10 +213,9 @@ def export_air(model_path, output_dir, device, batch_size, seq_len,
     print(f"=== 导出 AIR (动态): {output_dir}/{export_name}.air ===")
     print(f"  input_ids: {input_ids.shape}, position_ids: {position_ids.shape}")
     print(f"  actual_seq_lengths: {actual_seq_lengths.shape}")
-    print(f"  cos: {cos.shape}, sin: {sin.shape}")
 
     dynamo_export(
-        input_ids, position_ids, actual_seq_lengths, cos, sin,
+        input_ids, position_ids, actual_seq_lengths,
         model=export_model,
         export_path=output_dir,
         export_name=export_name,

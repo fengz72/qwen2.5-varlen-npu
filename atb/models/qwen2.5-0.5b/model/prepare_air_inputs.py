@@ -1,20 +1,14 @@
 """
-为 AIR 导出的 OM 模型生成 4 个用户输入数据 + golden logits。
+为 AIR 导出的 OM 模型生成 3 个用户输入数据 + golden logits。
 
-frozen_parameter=1 后, FFN 权重和 atten_mask 已冻结为图常量,
-OM 只有 4 个图输入 (Data 节点):
+frozen_parameter=1 后, FFN 权重、atten_mask、cos/sin 表 已冻结为图常量,
+OM 只有 3 个图输入 (Data 节点):
   - actual_seq_lengths [N] int64
-  - cos [1, T, 64] float16
-  - sin [1, T, 64] float16
+  - position_ids [T] int64 (用于图内 cos/sin Gather)
   - input_ids [T] int64
 
-(position_ids 虽是 forward 参数, 但因 cos/sin 图外预计算而在图中消除)
-
-cos/sin 预计算策略:
-  1. 图外预计算 max_seq_len 的 cos/sin 表 [1, MAX_SEQ_LEN, 64] (一次)
-  2. 运行时按 position_ids gather: cos_table[:, pos, :] → [1, T, 64]
-     varlen 中每条 seq 的 position 从 0 重启: pos = [0..207, 0..207, ...]
-  3. 图输入 shape 不变 [1, -1, 64], OM 模型无需重新导出
+cos/sin 表 [1, 1024, 64] 作为 register_buffer 注册, 配合 frozen_parameter=1
+成为图常量。图内按 position_ids gather 出 [1, T, 64], 无需用户提供 cos/sin。
 
 同时运行 eager 模式生成 golden logits 供精度对比。
 """
@@ -25,7 +19,7 @@ import os
 import torch
 import torch_npu
 
-from .varlen_utils import setup_varlen_attention, precompute_rope_cos_sin
+from .varlen_utils import setup_varlen_attention
 from .export_air import load_model, ExportWrapper
 from atb.tools.varlen import generate_varlen_inputs
 from atb.tools.lm_head_prune import load_target_tokens, prune_lm_head
@@ -38,7 +32,7 @@ DEFAULT_DEVICE = 0
 
 BATCH_SIZE = 10
 SEQ_LEN = 208
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1024
 
 
 def main():
@@ -67,37 +61,25 @@ def main():
     concat_ids, concat_pos, seq_lens, cum_seq_lens = generate_varlen_inputs(
         BATCH_SIZE, SEQ_LEN
     )
-    setup_varlen_attention(model, cum_seq_lens, 'npu')
+    setup_varlen_attention(model, cum_seq_lens, 'npu', max_seq_len=MAX_SEQ_LEN)
 
     print(f"seq_lens: {seq_lens[:5]}, cum_seq_lens: {cum_seq_lens}")
-
-    # 2.1 预计算 max_seq_len 的 cos/sin 表, 按 position_ids gather (varlen 每条 seq 从 0 重启)
-    precompute_rope_cos_sin(model, MAX_SEQ_LEN, 'npu')
-    cos_table = model.model.rotary_emb._cached_cos  # [1, MAX_SEQ_LEN, 64]
-    sin_table = model.model.rotary_emb._cached_sin
-    pos = concat_pos.squeeze(0).npu()  # [T] = [0..207, 0..207, ...]
-    model.model.rotary_emb._cached_cos = cos_table[:, pos, :]  # [1, T, 64]
-    model.model.rotary_emb._cached_sin = sin_table[:, pos, :]
-    print(f"cos/sin gathered: table=[1,{MAX_SEQ_LEN},64] → pos={pos.shape} → cos={model.model.rotary_emb._cached_cos.shape}")
 
     # 3. 生成 golden logits (eager 模式, 复用 ExportWrapper 保证与导出路径一致)
     print("=== 生成 golden logits (仅每条序列最后一个 token) ===")
     asl_tensor = torch.tensor(cum_seq_lens, dtype=torch.int64, device='npu')
-    cos = model.model.rotary_emb._cached_cos
-    sin = model.model.rotary_emb._cached_sin
     with torch.no_grad():
         golden_logits = ExportWrapper(model)(
             concat_ids.squeeze(0).npu(),
             concat_pos.squeeze(0).npu(),
-            asl_tensor, cos, sin
+            asl_tensor,
         ).cpu()
     print(f"golden_logits shape: {golden_logits.shape}")
 
-    # 4. 收集 4 个用户输入 (按 OM Data 节点顺序)
+    # 4. 收集 3 个用户输入 (arg 名称导出后验证)
     inputs = [
         ("actual_seq_lengths", torch.tensor(cum_seq_lens, dtype=torch.int64).cpu()),
-        ("cos", model.model.rotary_emb._cached_cos.cpu()),
-        ("sin", model.model.rotary_emb._cached_sin.cpu()),
+        ("position_ids", concat_pos.squeeze(0).cpu()),
         ("input_ids", concat_ids.squeeze(0).cpu()),
     ]
 
@@ -105,7 +87,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     list_lines = []
-    arg_names = ["arg1_1", "arg3_1", "arg5_1", "arg8_1"]
+    arg_names = ["arg1_1", "arg3_1", "arg5_1"]
     for idx, (name, tensor) in enumerate(inputs):
         fname = f"{name}.bin"
         fpath = os.path.join(args.output_dir, fname)

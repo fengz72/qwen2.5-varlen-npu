@@ -4,7 +4,7 @@
 替换项:
     1. RMSNorm:  Pow + ReduceMean + Add + Rsqrt + Mul + Cast → npu_rms_norm
     2. RoPE:     rotate_half(StridedSlice + Neg + Cat) + Mul + Add → npu_apply_rotary_pos_emb
-    3. RoPE cos/sin: 图内 Cast(206us) + MatMul + Cos + Sin → 图外预计算注入
+    3. RoPE cos/sin: 图内 Cast(206us) + MatMul + Cos + Sin → 图常量 + Gather
 
 注意: FFN 不使用 npu_ffn 融合。测试表明 npu_ffn (FFNV3) 的 tiling 策略对
       [2080,896]→[9728]→[4864]→[896] shape 不优, MAC 利用率仅 43.5%,
@@ -61,12 +61,14 @@ def _npu_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 # ==================== 3. RoPE cos/sin → 图外预计算 ====================
 
 def _npu_rotary_emb_forward(self, x, position_ids):
-    """直接返回图外预计算的 cos/sin, 避免图内 Cast/MatMul/Cos/Sin。
+    """从图常量 cos/sin 表中按 position_ids gather, 避免图内 Cast/MatMul/Cos/Sin。
 
-    cos/sin 由 setup_varlen_attention 在图外预计算并注入为 _cached_cos/_cached_sin。
-    图内不再产生 Cast(206us) + MatMul + Cat + Cos + Sin 共 5 个 kernel。
+    cos/sin 表 [1, MAX_SEQ_LEN, 64] 作为 register_buffer 注册,
+    配合 frozen_parameter=1 成为图常量。图内仅 2 个 Gather 算子。
     """
-    return self._cached_cos, self._cached_sin
+    cos = self._cos_table[:, position_ids, :]
+    sin = self._sin_table[:, position_ids, :]
+    return cos, sin
 
 
 # ==================== 统一入口 ====================
@@ -86,8 +88,8 @@ def apply_fusion_ops():
     modeling_qwen2.apply_rotary_pos_emb = _npu_apply_rotary_pos_emb
     print("[fusion] apply_rotary_pos_emb → npu_apply_rotary_pos_emb")
 
-    # 3. RoPE cos/sin 图外预计算
+    # 3. RoPE cos/sin 图常量 + Gather
     modeling_qwen2.Qwen2RotaryEmbedding.forward = _npu_rotary_emb_forward
-    print("[fusion] Qwen2RotaryEmbedding.forward → 图外预计算 cos/sin")
+    print("[fusion] Qwen2RotaryEmbedding.forward → 图常量 cos/sin + Gather")
 
 
